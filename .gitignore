@@ -1,0 +1,56 @@
+# Swift Package Manager and Xcode output
+.build/
+.swiftpm/
+DerivedData/
+build/
+dist/
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+*.xccheckout
+*.moved-aside
+*.hmap
+*.xcarchive/
+*.xcresult/
+*.dSYM/
+*.swiftmodule
+*.swiftdoc
+*.swiftsourceinfo
+
+# macOS metadata and editor backups
+.DS_Store
+.AppleDouble
+.LSOverride
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# Packaged app bundles
+*.app
+
+# Local credentials and configuration (keep config.example.json tracked)
+.env
+.env.*
+.envrc
+config.json
+*.local.json
+*.secret
+*.secrets
+*.pem
+*.p12
+*.pfx
+*.mobileprovision
+
+# Local backup state, logs, and service artifacts
+*.log
+*.log.*
+*.spool
+*.journal
+*.lock
+*.plist.local
+
+# Local agent/worktree notes
+.clanky-planning/
+.clanky-worktrees/
