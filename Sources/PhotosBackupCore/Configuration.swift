@@ -6,7 +6,175 @@ public enum AzureAuthenticationMode: String, Codable {
     case azureCli
 }
 
-public struct AppConfiguration: Codable {
+private struct ConfigurationDocument: Decodable {
+    var connectionString: String?
+    var storageAccountName: String?
+
+    // Read once from the previous, expanded config format so existing installs retain
+    // their destination and operational choices after the external file is simplified.
+    var blobEndpoint: String?
+    var azureCliPath: String?
+    var azureCliSubscription: String?
+    var container: String?
+    var prefix: String?
+    var libraryID: String?
+    var spoolDirectory: String?
+    var journalPath: String?
+    var logPath: String?
+    var maxSpoolBytes: Int64?
+    var blockSize: Int?
+    var maxRetries: Int?
+    var dailyHour: Int?
+    var timeZoneIdentifier: String?
+    var allowInsecureLocalHTTP: Bool?
+    var logMaxBytes: Int64?
+    var logFileCount: Int?
+
+    var authenticationMode: AzureAuthenticationMode?
+
+    func authentication() throws -> (connectionString: String?, storageAccountName: String?, mode: AzureAuthenticationMode) {
+        let connectionString = connectionString?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true
+            ? nil : connectionString
+        let accountName = storageAccountName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let storageAccountName = accountName?.isEmpty == false ? accountName : nil
+        guard (connectionString == nil) != (storageAccountName == nil) else {
+            throw BackupError.invalidConfiguration("choose exactly one: connectionString or storageAccountName")
+        }
+        let mode: AzureAuthenticationMode = connectionString == nil ? .azureCli : .connectionString
+        if let authenticationMode, authenticationMode != mode {
+            throw BackupError.invalidConfiguration("authenticationMode is inferred; remove the legacy authenticationMode field")
+        }
+        return (connectionString, storageAccountName, mode)
+    }
+}
+
+private struct AuthenticationConfiguration: Codable {
+    var connectionString: String?
+    var storageAccountName: String?
+}
+
+private struct PersistedRuntimeSettings: Codable {
+    var blobEndpoint: String?
+    var azureCliPath: String?
+    var azureCliSubscription: String?
+    var container: String
+    var prefix: String
+    var libraryID: String
+    var spoolDirectory: String
+    var journalPath: String
+    var logPath: String
+    var maxSpoolBytes: Int64
+    var blockSize: Int
+    var maxRetries: Int
+    var dailyHour: Int
+    var timeZoneIdentifier: String
+    var allowInsecureLocalHTTP: Bool
+    var logMaxBytes: Int64
+    var logFileCount: Int
+
+    static var storageRoot: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
+        return base.appendingPathComponent("PhotosBackup", isDirectory: true)
+    }
+
+    static var settingsURL: URL {
+        storageRoot.appendingPathComponent("state", isDirectory: true).appendingPathComponent("runtime.json")
+    }
+
+    static func defaults() -> PersistedRuntimeSettings {
+        let root = storageRoot
+        let logsBase = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library", isDirectory: true)
+        return PersistedRuntimeSettings(
+            blobEndpoint: nil, azureCliPath: nil, azureCliSubscription: nil,
+            container: "photos-backup", prefix: "photos-backup", libraryID: UUID().uuidString,
+            spoolDirectory: root.appendingPathComponent("Spool", isDirectory: true).path,
+            journalPath: root.appendingPathComponent("state/journal.json").path,
+            logPath: logsBase.appendingPathComponent("Logs/PhotosBackup/backup.log").path,
+            maxSpoolBytes: 20 * 1024 * 1024 * 1024, blockSize: 8 * 1024 * 1024, maxRetries: 4,
+            dailyHour: 2, timeZoneIdentifier: TimeZone.current.identifier, allowInsecureLocalHTTP: false,
+            logMaxBytes: 5 * 1024 * 1024, logFileCount: 5)
+    }
+
+    static func migrated(from document: ConfigurationDocument) -> PersistedRuntimeSettings {
+        let defaults = defaults()
+        return PersistedRuntimeSettings(
+            blobEndpoint: document.blobEndpoint ?? defaults.blobEndpoint,
+            azureCliPath: document.azureCliPath ?? defaults.azureCliPath,
+            azureCliSubscription: document.azureCliSubscription ?? defaults.azureCliSubscription,
+            container: document.container ?? defaults.container,
+            prefix: document.prefix ?? defaults.prefix,
+            libraryID: document.libraryID ?? defaults.libraryID,
+            spoolDirectory: document.spoolDirectory ?? defaults.spoolDirectory,
+            journalPath: document.journalPath ?? defaults.journalPath,
+            logPath: document.logPath ?? defaults.logPath,
+            maxSpoolBytes: document.maxSpoolBytes ?? defaults.maxSpoolBytes,
+            blockSize: document.blockSize ?? defaults.blockSize,
+            maxRetries: document.maxRetries ?? defaults.maxRetries,
+            dailyHour: document.dailyHour ?? defaults.dailyHour,
+            timeZoneIdentifier: document.timeZoneIdentifier ?? defaults.timeZoneIdentifier,
+            allowInsecureLocalHTTP: document.allowInsecureLocalHTTP ?? defaults.allowInsecureLocalHTTP,
+            logMaxBytes: document.logMaxBytes ?? defaults.logMaxBytes,
+            logFileCount: document.logFileCount ?? defaults.logFileCount)
+    }
+
+    static func loadOrCreate(from document: ConfigurationDocument) throws -> PersistedRuntimeSettings {
+        let url = settingsURL
+        try ensurePrivateDirectory(url.deletingLastPathComponent())
+        let lockURL = url.appendingPathExtension("lock")
+        let descriptor = open(lockURL.path, O_CREAT | O_RDWR | O_NOFOLLOW, mode_t(0o600))
+        guard descriptor >= 0 else { throw BackupError.invalidConfiguration("could not lock internal Photos Backup settings") }
+        defer { close(descriptor) }
+        guard flock(descriptor, LOCK_EX) == 0 else { throw BackupError.invalidConfiguration("could not lock internal Photos Backup settings") }
+        defer { _ = flock(descriptor, LOCK_UN) }
+        guard fchmod(descriptor, mode_t(0o600)) == 0 else {
+            throw BackupError.invalidConfiguration("could not secure internal Photos Backup settings lock")
+        }
+        var info = stat()
+        if lstat(url.path, &info) == 0 {
+            guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
+                throw BackupError.invalidConfiguration("internal settings must be a regular file, not a symlink")
+            }
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            let mode = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+            guard mode & 0o077 == 0 else { throw BackupError.invalidConfiguration("internal settings permissions must be 0600 or stricter") }
+            do { return try JSONDecoder().decode(PersistedRuntimeSettings.self, from: Data(contentsOf: url)) }
+            catch { throw BackupError.invalidConfiguration("could not read internal Photos Backup settings") }
+        }
+        guard errno == ENOENT else { throw BackupError.invalidConfiguration("could not inspect internal Photos Backup settings") }
+        let settings = migrated(from: document)
+        try save(settings, to: url)
+        return settings
+    }
+
+    static func save(_ settings: PersistedRuntimeSettings, to url: URL) throws {
+        try ensurePrivateDirectory(url.deletingLastPathComponent())
+        var info = stat()
+        if lstat(url.path, &info) == 0, (info.st_mode & mode_t(S_IFMT)) != mode_t(S_IFREG) {
+            throw BackupError.invalidConfiguration("internal settings output must be a regular file, not a symlink")
+        }
+        let data = try JSONEncoder.pretty.encode(settings)
+        try data.write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    private static func ensurePrivateDirectory(_ url: URL) throws {
+        var info = stat()
+        if lstat(url.path, &info) == 0 {
+            guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) else {
+                throw BackupError.invalidConfiguration("internal settings directory must not be a symlink")
+            }
+        } else {
+            guard errno == ENOENT else { throw BackupError.invalidConfiguration("could not inspect internal settings directory") }
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+    }
+}
+
+public struct AppConfiguration {
     public var connectionString: String?
     public var authenticationMode: AzureAuthenticationMode?
     public var storageAccountName: String?
@@ -63,8 +231,14 @@ public struct AppConfiguration: Codable {
         if let azureCliSubscription, azureCliSubscription.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             throw BackupError.invalidConfiguration("azureCliSubscription cannot be empty")
         }
+        let hasConnectionString = connectionString?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let hasStorageAccount = storageAccountName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        guard hasConnectionString != hasStorageAccount else {
+            throw BackupError.invalidConfiguration("choose exactly one: connectionString or storageAccountName")
+        }
+        let mode = authenticationMode ?? (hasConnectionString ? .connectionString : .azureCli)
         _ = try AzureCredentials(connectionString: connectionString, storageAccountName: storageAccountName,
-                                 blobEndpoint: blobEndpoint, authenticationMode: authenticationMode ?? .connectionString,
+                                 blobEndpoint: blobEndpoint, authenticationMode: mode,
                                  allowInsecureLocalHTTP: allowInsecureLocalHTTP)
     }
 
@@ -77,8 +251,27 @@ public struct AppConfiguration: Codable {
         let mode = (attrs[.posixPermissions] as? NSNumber)?.intValue ?? 0
         guard mode & 0o077 == 0 else { throw BackupError.invalidConfiguration("config file permissions must be 0600 or stricter: \(url.path)") }
         do {
-            let result = try JSONDecoder().decode(AppConfiguration.self, from: Data(contentsOf: url))
+            let data = try Data(contentsOf: url)
+            let document = try JSONDecoder().decode(ConfigurationDocument.self, from: data)
+            let authentication = try document.authentication()
+            let integrationConfig = ["PHOTOS_BACKUP_RUN_AZURE_CLI", "PHOTOS_BACKUP_RUN_REAL_AZURE", "PHOTOS_BACKUP_RUN_AZURITE"]
+                .contains { ProcessInfo.processInfo.environment[$0] == "1" }
+            let runtime = integrationConfig ? PersistedRuntimeSettings.migrated(from: document)
+                : try PersistedRuntimeSettings.loadOrCreate(from: document)
+            let result = AppConfiguration(
+                connectionString: authentication.connectionString, container: runtime.container, prefix: runtime.prefix,
+                libraryID: runtime.libraryID, spoolDirectory: runtime.spoolDirectory, journalPath: runtime.journalPath,
+                logPath: runtime.logPath, maxSpoolBytes: runtime.maxSpoolBytes, blockSize: runtime.blockSize,
+                maxRetries: runtime.maxRetries, dailyHour: runtime.dailyHour,
+                timeZoneIdentifier: runtime.timeZoneIdentifier, allowInsecureLocalHTTP: runtime.allowInsecureLocalHTTP,
+                logMaxBytes: runtime.logMaxBytes, logFileCount: runtime.logFileCount,
+                authenticationMode: authentication.mode, storageAccountName: authentication.storageAccountName,
+                blobEndpoint: runtime.blobEndpoint, azureCliPath: runtime.azureCliPath,
+                azureCliSubscription: runtime.azureCliSubscription)
             try result.validate()
+            if !integrationConfig, try needsSimplification(data, authentication: authentication) {
+                try result.save(to: url)
+            }
             return result
         } catch let error as BackupError { throw error }
         catch { throw BackupError.invalidConfiguration("could not read configuration JSON") }
@@ -93,9 +286,22 @@ public struct AppConfiguration: Codable {
                 throw BackupError.invalidConfiguration("config output must be a regular file, not a symlink")
             }
         }
-        let data = try JSONEncoder.pretty.encode(self)
+        let mode = authenticationMode ?? (storageAccountName == nil ? .connectionString : .azureCli)
+        let settings = AuthenticationConfiguration(
+            connectionString: mode == .connectionString ? connectionString : nil,
+            storageAccountName: mode == .azureCli ? storageAccountName : nil)
+        let data = try JSONEncoder.pretty.encode(settings)
         try data.write(to: url, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    private static func needsSimplification(_ data: Data,
+                                            authentication: (connectionString: String?, storageAccountName: String?, mode: AzureAuthenticationMode)) throws -> Bool {
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw BackupError.invalidConfiguration("configuration must be a JSON object")
+        }
+        let expected = authentication.mode == .connectionString ? "connectionString" : "storageAccountName"
+        return Set(object.keys) != Set([expected])
     }
 }
 

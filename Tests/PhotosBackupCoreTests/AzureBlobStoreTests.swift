@@ -135,6 +135,17 @@ final class AzureBlobStoreTests: XCTestCase {
         try await exerciseRealBlocks(store: store, config: config)
     }
 
+    func testAzureCliBlockUploadIsAvailableAsOptInIntegration() async throws {
+        guard ProcessInfo.processInfo.environment["PHOTOS_BACKUP_RUN_AZURE_CLI"] == "1",
+              let path = ProcessInfo.processInfo.environment["PHOTOS_BACKUP_AZURECLI_INTEGRATION_CONFIG"] else {
+            throw XCTSkip("Set PHOTOS_BACKUP_RUN_AZURE_CLI=1 and PHOTOS_BACKUP_AZURECLI_INTEGRATION_CONFIG to a private Azure CLI config for a synthetic-only Azure check")
+        }
+        let config = try AppConfiguration.load(from: URL(fileURLWithPath: path))
+        XCTAssertEqual(config.authenticationMode, .azureCli)
+        let store = try AzureBlobStore(configuration: config)
+        try await exerciseRealBlocks(store: store, config: config)
+    }
+
     private func exerciseRealBlocks(store firstClient: AzureBlobStore, config: AppConfiguration) async throws {
         let secondClient = try AzureBlobStore(configuration: config)
         let blobName = "swift-integration-\(UUID().uuidString.lowercased())"
@@ -149,6 +160,10 @@ final class AzureBlobStoreTests: XCTestCase {
         var stage = "initial block list"
         var conditionalBlob: String?
         do {
+            stage = "confirm target blob is absent"
+            let beforeUpload = try await firstClient.blob(blobName)
+            XCTAssertNil(beforeUpload)
+            stage = "initial block list"
             let initiallyStaged = try await firstClient.uncommittedBlockIDs(blobName)
             XCTAssertTrue(initiallyStaged.isEmpty)
             stage = "stage first block"

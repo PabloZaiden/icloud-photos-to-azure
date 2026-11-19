@@ -1,0 +1,94 @@
+name: Build signed macOS release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: photos-backup-release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-upload:
+    runs-on: macos-26
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Import signing identity
+        env:
+          SIGNING_CERTIFICATE_BASE64: ${{ secrets.PHOTOS_BACKUP_SIGNING_IDENTITY_P12_BASE64 }}
+          PHOTOS_BACKUP_SIGNING_P12_PASSWORD: ${{ secrets.PHOTOS_BACKUP_SIGNING_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SIGNING_CERTIFICATE_BASE64:-}" || -z "${PHOTOS_BACKUP_SIGNING_P12_PASSWORD:-}" ]]; then
+            echo "Missing repository signing identity secrets" >&2
+            exit 1
+          fi
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/photos-backup-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+          P12_PATH="$RUNNER_TEMP/photos-backup-signing.p12"
+          printf '%s' "$SIGNING_CERTIFICATE_BASE64" | base64 -D > "$P12_PATH"
+          chmod 600 "$P12_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security default-keychain -d user -s "$KEYCHAIN_PATH" >/dev/null
+          swift scripts/import-signing-identity.swift "$P12_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN_PATH" >/dev/null
+
+          echo "PHOTOS_BACKUP_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Test, package, and verify signature
+        env:
+          CODE_SIGN_IDENTITY: Photos Backup Release Signing
+        run: |
+          set -euo pipefail
+          swift test --scratch-path "$RUNNER_TEMP/photos-backup-tests"
+          bash scripts/package-app.sh "$RUNNER_TEMP/photos-backup-package"
+
+          APP="$RUNNER_TEMP/photos-backup-package/Photos Backup.app"
+          EXECUTABLE="$APP/Contents/MacOS/photos-backup"
+          SIGNATURE_INFO="$RUNNER_TEMP/photos-backup-signature.txt"
+          REQUIREMENT_INFO="$RUNNER_TEMP/photos-backup-requirement.txt"
+          codesign --verify --deep --strict "$APP"
+          codesign -dv --verbose=4 "$APP" > "$SIGNATURE_INFO" 2>&1
+          codesign -d -r - "$APP" > "$REQUIREMENT_INFO" 2>&1
+          grep -Fq "Authority=Photos Backup Release Signing" "$SIGNATURE_INFO"
+          grep -Fq 'identifier "com.photosbackup.cli"' "$REQUIREMENT_INFO"
+          if grep -qi 'cdhash' "$REQUIREMENT_INFO"; then
+            echo "The app has a build-specific designated requirement" >&2
+            exit 1
+          fi
+          if [[ "$(lipo -archs "$EXECUTABLE")" != "arm64" ]]; then
+            echo "Expected the arm64 release executable" >&2
+            exit 1
+          fi
+
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$RUNNER_TEMP/Photos-Backup-macos-arm64.zip"
+
+      - name: Attach ZIP to published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/Photos-Backup-macos-arm64.zip" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Remove signing keychain
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -n "${PHOTOS_BACKUP_KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "$PHOTOS_BACKUP_KEYCHAIN_PATH" >/dev/null 2>&1 || true
+          fi
+          rm -f "$RUNNER_TEMP/photos-backup-signing.p12"
