@@ -50,16 +50,13 @@ jobs:
             -P "$PHOTOS_BACKUP_SIGNING_P12_PASSWORD" \
             -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
-          if ! security find-identity -v -p codesigning "$KEYCHAIN_PATH" 2>/dev/null | grep -Fq '"Photos Backup Release Signing"'; then
-            echo "Signing identity is not available in the temporary keychain" >&2
-            exit 1
-          fi
           security list-keychains -d user -s "$KEYCHAIN_PATH" >/dev/null
 
-          SIGNING_IDENTITY="$(security find-certificate -a -Z "$KEYCHAIN_PATH" \
+          # Self-signed certificates can be omitted by `find-identity`; select the imported certificate directly.
+          SIGNING_IDENTITY="$(security find-certificate -a -c "Photos Backup Release Signing" -Z "$KEYCHAIN_PATH" \
             | awk '/^SHA-1 hash:/ && !found { print $3; found=1 }')"
           if [[ -z "$SIGNING_IDENTITY" ]]; then
-            echo "No imported signing certificate fingerprint was found" >&2
+            echo "Expected Photos Backup Release Signing certificate was not found" >&2
             security find-certificate -a -Z "$KEYCHAIN_PATH" >&2 || true
             exit 1
           fi
