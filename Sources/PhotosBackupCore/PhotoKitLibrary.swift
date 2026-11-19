@@ -324,7 +324,7 @@ public final class PhotoKitLibrary: PhotoLibrary {
                 }
             }
         } onCancel: {
-            session.cancelExport()
+            exportSession.value.cancelExport()
         }
         finished.set()
         monitor.cancel()
