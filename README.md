@@ -22,68 +22,45 @@ The package script builds `Photos Backup.app`, adds `NSPhotoLibraryUsageDescript
 CODE_SIGN_IDENTITY="Photos Backup Release Signing" bash scripts/package-app.sh
 ```
 
-Self-signed releases are not notarized and do not satisfy Gatekeeper's trusted-developer check; macOS may require a manual Open approval for downloaded releases. Use the release artifact for the installed service and keep the same signing certificate and bundle identifier. Move the packaged app to its permanent path before authorizing Photos or installing the service. macOS tracks privacy access using the app's designated code requirement. Run commands from `Photos Backup.app/Contents/MacOS/photos-backup` or a shell alias to that executable.
+The `.app` is a headless permission bundle, not a graphical interface. Photos requires an `NSPhotoLibraryUsageDescription` entry in the app's Info.plist; the installer keeps the signed bundle at a stable path and adds the `photo-backup` command to zsh's PATH. [Apple documents the required usage-description key](https://developer.apple.com/documentation/bundleresources/information-property-list/nsphotolibraryusagedescription).
+
+Self-signed releases are not notarized and do not satisfy Gatekeeper's trusted-developer check; macOS may require a manual Open approval for downloaded releases. After extracting the release ZIP, install the command once from its `Photos-Backup` folder:
+
+```sh
+bash install-cli.sh
+```
+
+Open a new Terminal window. The script installs the app in `~/Applications/Photos Backup.app`, installs `photo-backup` in `~/.local/bin`, and adds that directory to `~/.zprofile`.
 
 Publishing a GitHub release starts `.github/workflows/release-macos.yml`. It builds and tests on an arm64 macOS runner, verifies the stable signing identity, and attaches the fixed-name `Photos-Backup-macos-arm64.zip`. The workflow needs repository Actions secrets `PHOTOS_BACKUP_SIGNING_IDENTITY_P12_BASE64` and `PHOTOS_BACKUP_SIGNING_P12_PASSWORD`; the signing key is not stored in git. GitHub secrets are available to trusted repository workflows, not pull requests from forks. Do not print or commit the P12 or password.
 
-## Configure
+## Run
 
-Create the private application support directory and copy the example for the authentication method you want. The file needs exactly one value: a connection string or a storage account name for Azure CLI.
-
-```sh
-mkdir -p "$HOME/Library/Application Support/PhotosBackup"
-# AccountKey or SAS:
-cp config.example.json "$HOME/Library/Application Support/PhotosBackup/config.json"
-# For Azure CLI instead, use:
-# cp config.azure-cli.example.json "$HOME/Library/Application Support/PhotosBackup/config.json"
-chmod 600 "$HOME/Library/Application Support/PhotosBackup/config.json"
-```
-
-For a connection string, choose AccountKey:
-
-```text
-DefaultEndpointsProtocol=https;AccountName=<account>;AccountKey=<key>;EndpointSuffix=core.windows.net
-```
-
-or SAS:
-
-```text
-BlobEndpoint=https://<account>.blob.core.windows.net;SharedAccessSignature=<SAS query>
-```
-
-The client preserves SAS percent escapes in the signed URL query. It sends a Shared Key Authorization header for AccountKey and uses HTTPS for Azure. Plain HTTP is accepted only for an explicitly enabled loopback development endpoint (for example Azurite).
-
-### Use the signed-in Azure CLI session
-
-To avoid storing a key or SAS, copy `config.azure-cli.example.json` instead and enter the storage account name. The app infers Azure CLI authentication and the standard Blob endpoint. Then sign in once with Azure CLI if needed:
+Azure CLI authentication needs only the storage account name. Sign in once if needed, then use the command sequence below:
 
 ```sh
 az login
-az account show --output table
+photo-backup config --storage-account "storageaccount"
+photo-backup authorize
+photo-backup doctor
+photo-backup sync --dry-run
+photo-backup sync
+photo-backup service install
 ```
 
-The app asks `az account get-access-token` for a token scoped to Azure Storage, keeps it in memory, and refreshes it before expiry. It does not write the token to config, journal, or logs. Azure CLI persists the signed-in account's refresh credentials for later token requests; the daily LaunchAgent must run as the same macOS user. If the storage account is in another subscription, select it in the CLI first with `az account set --subscription ...`. [Azure CLI documents token expiry and recommends the UTC `expires_on` field](https://learn.microsoft.com/en-us/cli/azure/account?view=azure-cli-latest#az-account-get-access-token), and [how `az login` stores and refreshes the signed-in session](https://learn.microsoft.com/en-us/cli/azure/authenticate-azure-cli-interactively).
+`config` creates the private config automatically. For AccountKey or SAS instead, run `photo-backup config --connection-string`; it prompts with input hidden. The app uses the existing `photos-backup` container and prefix, so neither belongs in the config. The active Azure CLI subscription is used; run `az account set --subscription ...` first only if needed.
 
-Grant the signed-in user **Storage Blob Data Contributor** on the target container or storage account. Azure management roles such as `Owner` by themselves do not grant blob data access. [Microsoft's Blob authorization guide describes the data roles](https://learn.microsoft.com/en-us/azure/storage/blobs/authorize-access-azure-active-directory).
+Azure CLI asks for a token scoped to Storage, keeps it in memory, and refreshes it before expiry. It does not write the token to config, journal, or logs. Azure CLI persists the signed-in account's refresh credentials for later token requests; the daily LaunchAgent runs as that same macOS user. The app finds `az` on `PATH` and common Homebrew paths. [Azure CLI documents token expiry and how `az login` stores the session](https://learn.microsoft.com/en-us/cli/azure/authenticate-azure-cli-interactively).
 
-The app finds `az` on `PATH` and common Homebrew paths. If Azure CLI asks for sign-in again, run `az login` as the same user and rerun `doctor`.
-
-For AccountKey or SAS, use `config.example.json`. Scope SAS to the `photos-backup` container with the operations needed to list/read blob metadata, stage and commit blocks, update metadata, and delete the temporary doctor probe. That container must already exist. Config files require mode `0600` or stricter. The app stores its generated library ID and internal runtime defaults privately under Application Support; the journal, spool, logs, run lock, and LaunchAgent property list are also private to the user.
-
-The JSON has one user setting:
-
-- `connectionString`: AccountKey or SAS authentication, or
-- `storageAccountName`: Azure CLI authentication using the active signed-in account.
-
-Do not include both. The app uses the existing `photos-backup` container and the `photos-backup` namespace prefix. It creates and retains a stable library ID on first use, and sets paths, spool limit (20 GiB), block size, retries, log rotation, and a daily 2:00 AM schedule internally. Date filters use the Mac's current time zone. When it sees an older expanded config, the app migrates its destination, library ID, and operational values to private internal state, then rewrites the user config to just the authentication value.
+The storage account must have an existing `photos-backup` container. The signed-in user needs **Storage Blob Data Contributor** on the container or account; Azure management roles such as `Owner` by themselves do not grant blob data access. [Microsoft documents the Blob data roles](https://learn.microsoft.com/en-us/azure/storage/blobs/authorize-access-azure-active-directory). Config files and internal settings are written with mode `0600`; runtime paths, limits, retries, logging, library ID, and daily 2:00 AM schedule use private defaults.
 
 ## Authorize and check
 
-From the packaged app:
+Use the installed command:
 
 ```sh
-"/Applications/Photos Backup.app/Contents/MacOS/photos-backup" authorize
-"/Applications/Photos Backup.app/Contents/MacOS/photos-backup" doctor
+photo-backup authorize
+photo-backup doctor
 ```
 
 `authorize` requests full Photos read access. Limited Photos access is not enough for a whole-library backup. `doctor` checks that full authorization is present, the spool directory is writable, and an isolated temporary blob can be written, read, and deleted under the configured prefix. It does not export a photo, validate every library item, check iCloud synchronization completeness, or prove backup fidelity.
@@ -91,10 +68,10 @@ From the packaged app:
 ## Sync
 
 ```sh
-photos-backup sync
-photos-backup sync --from 2024-01-01
-photos-backup sync --to 2024-12-31
-photos-backup sync --from 2024-01-01 --to 2024-12-31 --dry-run
+photo-backup sync
+photo-backup sync --from 2024-01-01
+photo-backup sync --to 2024-12-31
+photo-backup sync --from 2024-01-01 --to 2024-12-31 --dry-run
 ```
 
 With no dates, the command enumerates the full accessible library on every run; it does not use a last-run watermark. Dates use the Photos capture date in the Mac's current time zone, and both ends are inclusive. Missing capture dates are included only without a filter; with a filter, they are reported as unclassifiable and the run exits nonzero. A dry run queries Photos inventory and Azure manifests but does not export/download resources, write blobs, update manifests, or clear recovery state. It reports `would upload` candidates; a changed source date may need export/hash comparison in a real run, so this is an estimate.
@@ -123,12 +100,12 @@ The backup is cumulative: removing an asset in Photos does not remove its Azure 
 
 ## Daily LaunchAgent
 
-Use the packaged app at its final path and config path:
+Manage the daily LaunchAgent with the installed command:
 
 ```sh
-photos-backup service install --config "$HOME/Library/Application Support/PhotosBackup/config.json"
-photos-backup service status --config "$HOME/Library/Application Support/PhotosBackup/config.json"
-photos-backup service uninstall --config "$HOME/Library/Application Support/PhotosBackup/config.json"
+photo-backup service install
+photo-backup service status
+photo-backup service uninstall
 ```
 
 `install` first requests full Photos access if needed, checks the local spool and performs `doctor`'s Azure write/read/delete probe. It checks that the current user can write the LaunchAgents directory, then installs and loads the job only if all preflight checks pass. A denied Photos permission or failed Azure check leaves the service uninstalled. The job runs daily at 2:00 AM local time while the user is logged in; it does not start a backup immediately when installed. launchd may run a missed calendar event after wake; the Mac must be powered on and the user session available. It is not a daemon that runs while logged out. Uninstalling unloads/removes only the plist and keeps config, journal, logs, spool, and remote blobs. Standard error goes to `<logPath>.launchd`; application logs rotate by internal defaults.

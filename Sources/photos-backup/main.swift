@@ -12,20 +12,53 @@ struct PhotosBackupCommand {
             let args = try Arguments(Array(CommandLine.arguments.dropFirst()))
             switch args.command {
             case "help", "--help", "-h": print(usage)
+            case "config": try configure(args)
             case "authorize": try await authorize()
             case "doctor": try await doctor(configURL: args.configURL)
             case "sync": try await sync(args)
             case "service": try await service(args)
-            default: throw BackupError.invalidArgument("unknown command; run photos-backup help")
+            default: throw BackupError.invalidArgument("unknown command; run photo-backup help")
             }
         } catch {
             let message: String
             if let e = error as? BackupError { message = e.description }
             else if let e = error as? BlobConditionFailed { message = e.description }
             else { message = "Operation failed (\(type(of: error)))" }
-            fputs("photos-backup: \(message)\n", stderr)
+            fputs("photo-backup: \(message)\n", stderr)
             Foundation.exit(2)
         }
+    }
+
+    private static func configure(_ args: Arguments) throws {
+        guard args.positionals.isEmpty else {
+            throw BackupError.invalidArgument("usage: photo-backup config --storage-account NAME | --connection-string [--config PATH]")
+        }
+        let connectionString = args.connectionStringPrompt ? try readHiddenConnectionString() : nil
+        try AppConfiguration.configure(connectionString: connectionString,
+                                       storageAccountName: args.storageAccountName,
+                                       at: args.configURL)
+        if args.connectionStringPrompt { print("Saved Azure connection string.") }
+        else { print("Saved Azure CLI storage account. Container: photos-backup.") }
+    }
+
+    private static func readHiddenConnectionString() throws -> String {
+        guard isatty(STDIN_FILENO) == 1 else {
+            throw BackupError.invalidArgument("--connection-string needs an interactive terminal so the value is not echoed")
+        }
+        let capacity = 16_384
+        let buffer = UnsafeMutablePointer<CChar>.allocate(capacity: capacity)
+        defer {
+            memset(buffer, 0, capacity)
+            buffer.deallocate()
+        }
+        guard readpassphrase("Azure connection string (input hidden): ", buffer, capacity, 0) != nil else {
+            throw BackupError.permission("could not read the connection string from the terminal")
+        }
+        let value = String(cString: buffer)
+        guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw BackupError.invalidConfiguration("connection string cannot be empty")
+        }
+        return value
     }
 
     private static func authorize() async throws {
@@ -35,9 +68,9 @@ struct PhotosBackupCommand {
         var state = library.authorization()
         if state == "not-determined" { state = await library.requestAuthorization() }
         guard state == "authorized" else {
-            throw BackupError.permission("full Photos access is required; current status is \(state). If macOS did not show a prompt, enable access in System Settings > Privacy & Security > Photos and rerun authorize")
+            throw BackupError.permission("full Photos access is required; current status is \(state). If macOS did not show a prompt, enable access in System Settings > Privacy & Security > Photos and rerun photo-backup authorize")
         }
-        print("Photos access is authorized for this app bundle.")
+        print("Photos access is authorized.")
         #else
         throw BackupError.permission("PhotoKit is available only on macOS")
         #endif
@@ -49,7 +82,7 @@ struct PhotosBackupCommand {
         let logger = loggerFor(config)
         let library = PhotoKitLibrary(libraryID: config.libraryID)
         guard library.authorization() == "authorized" else {
-            throw BackupError.permission("full read access is required; run authorize in the packaged app (status: \(library.authorization()))")
+            throw BackupError.permission("full read access is required; run photo-backup authorize (status: \(library.authorization()))")
         }
         let spool = config.resolve(config.spoolDirectory)
         try FileManager.default.createDirectory(at: spool, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -93,7 +126,7 @@ struct PhotosBackupCommand {
 
     private static func service(_ args: Arguments) async throws {
         guard let subcommand = args.positionals.first, ["install", "uninstall", "status"].contains(subcommand) else {
-            throw BackupError.invalidArgument("usage: photos-backup service install|uninstall|status [--config PATH]")
+            throw BackupError.invalidArgument("usage: photo-backup service install|uninstall|status [--config PATH]")
         }
         let label = "com.photosbackup.daily"
         let domain = "gui/\(getuid())"
@@ -140,18 +173,19 @@ struct PhotosBackupCommand {
     private static func requirePackagedApp() throws {
         guard Bundle.main.bundleURL.pathExtension == "app",
               Bundle.main.infoDictionary?["NSPhotoLibraryUsageDescription"] as? String != nil else {
-            throw BackupError.permission("run this command from the packaged Photos Backup.app so macOS can associate Photos permission with its bundle")
+            throw BackupError.permission("install the headless Photos Backup app with install-cli.sh, then run photo-backup again")
         }
     }
 
     private static let usage = """
-    photos-backup authorize
-    photos-backup doctor [--config PATH]
-    photos-backup sync [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--dry-run] [--config PATH]
-    photos-backup service install|uninstall|status [--config PATH]
+    photo-backup config --storage-account NAME | --connection-string [--config PATH]
+    photo-backup authorize
+    photo-backup doctor [--config PATH]
+    photo-backup sync [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--dry-run] [--config PATH]
+    photo-backup service install|uninstall|status [--config PATH]
 
     With no date filters, sync scans the full Photos library. Date limits are inclusive in the
-    configured time zone. Use the packaged .app executable for Photos authorization. service install
+    configured time zone. The installed command uses a headless app bundle for Photos permission; no GUI is shown. service install
     requests Photos access, runs doctor against local storage and Azure, and installs the daily LaunchAgent
     only after preflight succeeds.
     """
@@ -163,6 +197,8 @@ private struct Arguments {
     var from: String?
     var to: String?
     var dryRun = false
+    var storageAccountName: String?
+    var connectionStringPrompt = false
     var positionals: [String] = []
     init(_ values: [String]) throws {
         guard let command = values.first else { self.command = "help"; return }
@@ -181,6 +217,12 @@ private struct Arguments {
                 guard index + 1 < values.count else { throw BackupError.invalidArgument("--to requires YYYY-MM-DD") }
                 to = values[index + 1]; index += 2
             case "--dry-run": dryRun = true; index += 1
+            case "--storage-account":
+                guard index + 1 < values.count, !values[index + 1].hasPrefix("--") else {
+                    throw BackupError.invalidArgument("--storage-account requires an account name")
+                }
+                storageAccountName = values[index + 1]; index += 2
+            case "--connection-string": connectionStringPrompt = true; index += 1
             default:
                 guard !value.hasPrefix("--") else { throw BackupError.invalidArgument("unknown option \(value)") }
                 positionals.append(value); index += 1
@@ -188,6 +230,14 @@ private struct Arguments {
         }
         if self.command != "sync" && (from != nil || to != nil || dryRun) { throw BackupError.invalidArgument("date filters and --dry-run are valid only for sync") }
         if self.command == "sync" && !positionals.isEmpty { throw BackupError.invalidArgument("sync accepts no positional arguments") }
+        if self.command == "config" {
+            guard (storageAccountName != nil) != connectionStringPrompt else {
+                throw BackupError.invalidArgument("choose exactly one: --storage-account NAME or --connection-string")
+            }
+            guard from == nil, to == nil, !dryRun else { throw BackupError.invalidArgument("config accepts only an authentication option and --config PATH") }
+        } else if storageAccountName != nil || connectionStringPrompt {
+            throw BackupError.invalidArgument("--storage-account and --connection-string are valid only for config")
+        }
     }
 }
 
