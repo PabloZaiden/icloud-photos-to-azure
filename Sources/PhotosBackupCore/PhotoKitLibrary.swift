@@ -33,7 +33,7 @@ public final class PhotoKitLibrary: PhotoLibrary {
 
     public func enumerate(filter: DateFilter, consume: (BackupItem) async throws -> Void) async throws {
         guard status == .authorized else {
-            throw BackupError.permission("full read access is required (current status: \(authorization())); run photos-backup authorize from the packaged app")
+            throw BackupError.permission("full read access is required (current status: \(authorization())); run photo-backup authorize")
         }
         let options = PHFetchOptions()
         options.includeHiddenAssets = policy.includeHiddenAssets

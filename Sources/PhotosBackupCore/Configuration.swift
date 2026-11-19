@@ -37,10 +37,8 @@ private struct ConfigurationDocument: Decodable {
             ? nil : connectionString
         let accountName = storageAccountName?.trimmingCharacters(in: .whitespacesAndNewlines)
         let storageAccountName = accountName?.isEmpty == false ? accountName : nil
-        guard (connectionString == nil) != (storageAccountName == nil) else {
-            throw BackupError.invalidConfiguration("choose exactly one: connectionString or storageAccountName")
-        }
-        let mode: AzureAuthenticationMode = connectionString == nil ? .azureCli : .connectionString
+        let settings = AuthenticationConfiguration(connectionString: connectionString, storageAccountName: storageAccountName)
+        let mode = try settings.authenticationMode()
         if let authenticationMode, authenticationMode != mode {
             throw BackupError.invalidConfiguration("authenticationMode is inferred; remove the legacy authenticationMode field")
         }
@@ -51,6 +49,30 @@ private struct ConfigurationDocument: Decodable {
 private struct AuthenticationConfiguration: Codable {
     var connectionString: String?
     var storageAccountName: String?
+
+    func authenticationMode() throws -> AzureAuthenticationMode {
+        let hasConnectionString = connectionString?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let hasStorageAccount = storageAccountName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        guard hasConnectionString != hasStorageAccount else {
+            throw BackupError.invalidConfiguration("choose exactly one: connectionString or storageAccountName")
+        }
+        let mode: AzureAuthenticationMode = hasConnectionString ? .connectionString : .azureCli
+        _ = try AzureCredentials(connectionString: connectionString, storageAccountName: storageAccountName,
+                                 authenticationMode: mode)
+        return mode
+    }
+
+    func save(to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        var info = stat()
+        if lstat(url.path, &info) == 0, (info.st_mode & mode_t(S_IFMT)) != mode_t(S_IFREG) {
+            throw BackupError.invalidConfiguration("config output must be a regular file, not a symlink")
+        }
+        let data = try JSONEncoder.pretty.encode(self)
+        try data.write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
 }
 
 private struct PersistedRuntimeSettings: Codable {
@@ -279,20 +301,40 @@ public struct AppConfiguration {
 
     public func save(to url: URL) throws {
         try validate()
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if FileManager.default.fileExists(atPath: url.path) {
-            var info = stat()
-            guard lstat(url.path, &info) == 0, (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
-                throw BackupError.invalidConfiguration("config output must be a regular file, not a symlink")
-            }
-        }
         let mode = authenticationMode ?? (storageAccountName == nil ? .connectionString : .azureCli)
         let settings = AuthenticationConfiguration(
             connectionString: mode == .connectionString ? connectionString : nil,
             storageAccountName: mode == .azureCli ? storageAccountName : nil)
-        let data = try JSONEncoder.pretty.encode(settings)
-        try data.write(to: url, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        try settings.save(to: url)
+    }
+
+    public static func configure(connectionString: String? = nil, storageAccountName: String? = nil,
+                                  at url: URL) throws {
+        let accountName = storageAccountName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let settings = AuthenticationConfiguration(
+            connectionString: connectionString,
+            storageAccountName: accountName?.isEmpty == false ? accountName : nil)
+        _ = try settings.authenticationMode()
+
+        var info = stat()
+        if lstat(url.path, &info) == 0 {
+            guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
+                throw BackupError.invalidConfiguration("config must be a regular file, not a symlink")
+            }
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+            guard permissions & 0o077 == 0 else {
+                throw BackupError.invalidConfiguration("config file permissions must be 0600 or stricter: \(url.path)")
+            }
+            do {
+                let document = try JSONDecoder().decode(ConfigurationDocument.self, from: Data(contentsOf: url))
+                _ = try PersistedRuntimeSettings.loadOrCreate(from: document)
+            } catch let error as BackupError { throw error }
+            catch { throw BackupError.invalidConfiguration("could not migrate the existing configuration") }
+        } else if errno != ENOENT {
+            throw BackupError.invalidConfiguration("could not inspect existing configuration")
+        }
+        try settings.save(to: url)
     }
 
     private static func needsSimplification(_ data: Data,

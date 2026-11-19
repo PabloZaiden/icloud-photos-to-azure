@@ -73,7 +73,11 @@ jobs:
             exit 1
           fi
 
-          ditto -c -k --sequesterRsrc --keepParent "$APP" "$RUNNER_TEMP/Photos-Backup-macos-arm64.zip"
+          RELEASE_DIR="$RUNNER_TEMP/Photos-Backup"
+          mkdir -p "$RELEASE_DIR"
+          ditto "$APP" "$RELEASE_DIR/Photos Backup.app"
+          install -m 755 install-cli.sh "$RELEASE_DIR/install-cli.sh"
+          ditto -c -k --sequesterRsrc --keepParent "$RELEASE_DIR" "$RUNNER_TEMP/Photos-Backup-macos-arm64.zip"
 
       - name: Attach ZIP to published release
         env:
