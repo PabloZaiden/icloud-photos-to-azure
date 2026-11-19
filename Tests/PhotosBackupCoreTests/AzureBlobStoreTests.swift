@@ -25,6 +25,71 @@ final class AzureBlobStoreTests: XCTestCase {
         XCTAssertFalse(observed.url?.absoluteString.contains("blockid=+/8A") == true)
     }
 
+    func testAzureCliUsesBearerTokenFromCurrentSessionAndCachesItInMemory() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("azure-cli-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let calls = root.appendingPathComponent("calls.txt")
+        let az = root.appendingPathComponent("az")
+        let expectedArguments = "account get-access-token --resource https://storage.azure.com/ --subscription synthetic-subscription --output json"
+        let script = """
+        #!/bin/sh
+        case "$*" in
+          '\(expectedArguments)') ;;
+          *) exit 91 ;;
+        esac
+        printf 'called\\n' >> '\(calls.path)'
+        printf '%s\\n' '{"accessToken":"synthetic-storage-token","expires_on":4102444800,"tokenType":"Bearer"}'
+        """
+        try script.write(to: az, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: az.path)
+        let config = AppConfiguration(container: "photos-backup-test", prefix: "cli-test", libraryID: "test-library",
+                                      spoolDirectory: root.appendingPathComponent("spool").path,
+                                      journalPath: root.appendingPathComponent("journal.json").path,
+                                      logPath: root.appendingPathComponent("run.log").path,
+                                      authenticationMode: .azureCli, storageAccountName: "photostoragetest",
+                                      azureCliPath: az.path, azureCliSubscription: "synthetic-subscription")
+        let store = try AzureBlobStore(configuration: config, session: stubSession(status: 201, headers: ["ETag": "\"etag\""]))
+
+        _ = try await store.publish("first", metadata: [:], ifMatch: nil, ifNoneMatch: true)
+        _ = try await store.publish("second", metadata: [:], ifMatch: nil, ifNoneMatch: true)
+
+        let observed = try XCTUnwrap(CapturingURLProtocol.lastRequest)
+        XCTAssertEqual(observed.value(forHTTPHeaderField: "Authorization"), "Bearer synthetic-storage-token")
+        XCTAssertEqual(observed.url?.host, "photostoragetest.blob.core.windows.net")
+        XCTAssertFalse(observed.url?.absoluteString.contains("synthetic-storage-token") == true)
+        XCTAssertEqual(try String(contentsOf: calls, encoding: .utf8).split(whereSeparator: { $0.isNewline }).count, 1)
+        XCTAssertNil(config.connectionString)
+    }
+
+    func testAzureCliFailureDoesNotExposeCLIStderr() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("azure-cli-failure-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let az = root.appendingPathComponent("az")
+        let script = """
+        #!/bin/sh
+        printf '%s\\n' 'PRIVATE-CLI-DETAIL' >&2
+        exit 42
+        """
+        try script.write(to: az, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: az.path)
+        let config = AppConfiguration(container: "photos-backup-test", libraryID: "test-library",
+                                      spoolDirectory: root.appendingPathComponent("spool").path,
+                                      journalPath: root.appendingPathComponent("journal.json").path,
+                                      logPath: root.appendingPathComponent("run.log").path,
+                                      authenticationMode: .azureCli, storageAccountName: "photostoragetest",
+                                      azureCliPath: az.path)
+        let store = try AzureBlobStore(configuration: config, session: stubSession(status: 201, headers: ["ETag": "\"etag\""]))
+        do {
+            _ = try await store.publish("failure", metadata: [:], ifMatch: nil, ifNoneMatch: true)
+            XCTFail("Expected an Azure CLI authentication failure")
+        } catch let error as BackupError {
+            XCTAssertTrue(error.description.contains("exit code 42"))
+            XCTAssertFalse(error.description.contains("PRIVATE-CLI-DETAIL"))
+        }
+    }
+
     func testSASAllowsLoopbackHTTPOnlyWhenExplicitlyEnabled() throws {
         XCTAssertNoThrow(try AzureCredentials(connectionString: "BlobEndpoint=http://127.0.0.1:11000/devstoreaccount1;SharedAccessSignature=sv=x&sig=abc",
                                               allowInsecureLocalHTTP: true))

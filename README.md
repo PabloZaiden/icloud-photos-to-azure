@@ -26,33 +26,55 @@ Move the packaged app to its permanent path before authorizing Photos or install
 
 ## Configure
 
-Create the private application support directory and copy the example. Replace the placeholders locally with a stable library UUID, existing container name, Azure connection string, and your preferred prefix. Never put credentials in command arguments or commit a real config file.
+Create the private application support directory and copy one example. Fill in the stable library UUID, existing container, and preferred prefix. Never put credentials in command arguments or commit a real config file.
 
 ```sh
 mkdir -p "$HOME/Library/Application Support/PhotosBackup"
+# AccountKey or SAS:
 cp config.example.json "$HOME/Library/Application Support/PhotosBackup/config.json"
+# For Azure CLI instead, use:
+# cp config.azure-cli.example.json "$HOME/Library/Application Support/PhotosBackup/config.json"
 chmod 600 "$HOME/Library/Application Support/PhotosBackup/config.json"
 ```
 
-Use either an AccountKey connection string:
+For a connection string, choose AccountKey:
 
 ```text
 DefaultEndpointsProtocol=https;AccountName=<account>;AccountKey=<key>;EndpointSuffix=core.windows.net
 ```
 
-or a SAS connection string:
+or SAS:
 
 ```text
 BlobEndpoint=https://<account>.blob.core.windows.net;SharedAccessSignature=<SAS query>
 ```
 
-The client preserves SAS percent escapes in the signed URL query. It sends a Shared Key Authorization header only when `AccountKey` is present. Use HTTPS for Azure. Plain HTTP is accepted only for an explicitly enabled loopback development endpoint (for example Azurite).
+The client preserves SAS percent escapes in the signed URL query. It sends a Shared Key Authorization header for AccountKey and uses HTTPS for Azure. Plain HTTP is accepted only for an explicitly enabled loopback development endpoint (for example Azurite).
 
-Use a SAS scoped to the configured container and prefix with the operations needed to list/read blob metadata, stage and commit blocks, update metadata, and delete the temporary doctor probe. The container must already exist for normal backups. Do not share the config file; the program requires mode `0600` or stricter. The journal, spool, logs, run lock, and LaunchAgent property list are also private to the user.
+### Use the signed-in Azure CLI session
+
+To avoid storing a key or SAS, copy `config.azure-cli.example.json` instead. It contains only the storage account name, Blob endpoint, container, and prefix. Then sign in once with Azure CLI if needed:
+
+```sh
+az login
+az account show --output table
+```
+
+Set `authenticationMode` to `azureCli`. The app asks `az account get-access-token` for a token scoped to Azure Storage, keeps it in memory, and refreshes it before expiry. It does not write the token to config, journal, or logs. Azure CLI persists the signed-in account's refresh credentials for later token requests; the daily LaunchAgent must run as the same macOS user. [Azure CLI documents token expiry and recommends the UTC `expires_on` field](https://learn.microsoft.com/en-us/cli/azure/account?view=azure-cli-latest#az-account-get-access-token), and [how `az login` stores and refreshes the signed-in session](https://learn.microsoft.com/en-us/cli/azure/authenticate-azure-cli-interactively).
+
+Grant the signed-in user **Storage Blob Data Contributor** on the target container or storage account. Azure management roles such as `Owner` by themselves do not grant blob data access. [Microsoft's Blob authorization guide describes the data roles](https://learn.microsoft.com/en-us/azure/storage/blobs/authorize-access-azure-active-directory).
+
+Set `azureCliSubscription` only when the storage account belongs to a subscription other than the active Azure CLI subscription. Set `azureCliPath` to the absolute `az` executable path if LaunchAgent cannot find it on `PATH`; the app checks common Homebrew paths too. If Azure CLI asks for sign-in again, run `az login` as the same user and rerun `doctor`.
+
+For AccountKey or SAS, use `config.example.json`. Scope SAS to the configured container and prefix with the operations needed to list/read blob metadata, stage and commit blocks, update metadata, and delete the temporary doctor probe. The container must already exist for normal backups. Config files require mode `0600` or stricter. The journal, spool, logs, run lock, and LaunchAgent property list are also private to the user.
 
 Important config values:
 
 - `libraryID`: a stable, unique UUID for this Photos library. Keep it across runs and app reinstalls.
+- `authenticationMode`: `connectionString` for AccountKey/SAS, or `azureCli` to use the active user's signed-in Azure CLI session.
+- `connectionString`: required only for `connectionString` mode; omit it in Azure CLI mode.
+- `storageAccountName`, `blobEndpoint`: non-secret Azure storage location fields for `azureCli`. The standard endpoint is inferred from the account name if `blobEndpoint` is omitted.
+- `azureCliSubscription`, `azureCliPath`: optional subscription selector and absolute path to the `az` executable.
 - `container`, `prefix`: destination location. A prefix scopes all manifests and content objects.
 - `spoolDirectory`, `journalPath`, `logPath`: absolute paths or `~/` paths so launchd resolves them the same way as Terminal.
 - `maxSpoolBytes`: maximum space retained for complete exports waiting for Azure. The current default is 20 GiB; choose a value that fits available disk space.
@@ -118,7 +140,7 @@ photos-backup service uninstall --config "$HOME/Library/Application Support/Phot
 
 ## Tests
 
-The regular suite uses fixture PhotoKit and a fake BlobStore. It covers date boundaries and DST, hidden/burst selection policy, object/manifest behavior, edits and reverts, missing remote objects, ETag conflicts, partial blocks across new engine instances, changed block sizing, changed source bytes, corrupted/lost checkpoints, disk limits, and lost commit replies.
+The regular suite uses fixture PhotoKit and a fake BlobStore. It covers date boundaries and DST, hidden/burst selection policy, object/manifest behavior, edits and reverts, missing remote objects, ETag conflicts, partial blocks across new engine instances, changed block sizing, changed source bytes, corrupted/lost checkpoints, disk limits, lost commit replies, and Azure CLI bearer-token acquisition/caching without exposing CLI stderr.
 
 The Azurite test is opt-in and uses the public development-only account key against loopback only. It creates a local test container if needed and exercises Shared Key authentication, block list reconciliation, commit, metadata, download, and conditional writes:
 

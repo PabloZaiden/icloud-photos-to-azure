@@ -80,14 +80,15 @@ struct PhotosBackupCommand {
     }
 
     private static func loggerFor(_ config: AppConfiguration) -> SafeLogger {
-        let privateValues = config.connectionString.components(separatedBy: ";").compactMap { component -> String? in
+        let connectionString = config.connectionString ?? ""
+        let privateValues = connectionString.components(separatedBy: ";").compactMap { component -> String? in
             for name in ["AccountKey=", "SharedAccessSignature="] where component.hasPrefix(name) {
                 return String(component.dropFirst(name.count))
             }
             return nil
         }
         return SafeLogger(url: config.resolve(config.logPath), maxBytes: config.logMaxBytes, count: config.logFileCount,
-                          secrets: [config.connectionString] + privateValues)
+                          secrets: [connectionString] + privateValues)
     }
 
     private static func service(_ args: Arguments) throws {

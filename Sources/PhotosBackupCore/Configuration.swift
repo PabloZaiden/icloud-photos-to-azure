@@ -1,8 +1,18 @@
 import Foundation
 import Darwin
 
+public enum AzureAuthenticationMode: String, Codable {
+    case connectionString
+    case azureCli
+}
+
 public struct AppConfiguration: Codable {
-    public var connectionString: String
+    public var connectionString: String?
+    public var authenticationMode: AzureAuthenticationMode?
+    public var storageAccountName: String?
+    public var blobEndpoint: String?
+    public var azureCliPath: String?
+    public var azureCliSubscription: String?
     public var container: String
     public var prefix: String
     public var libraryID: String
@@ -18,12 +28,16 @@ public struct AppConfiguration: Codable {
     public var logMaxBytes: Int64
     public var logFileCount: Int
 
-    public init(connectionString: String, container: String, prefix: String = "", libraryID: String = UUID().uuidString,
+    public init(connectionString: String? = nil, container: String, prefix: String = "", libraryID: String = UUID().uuidString,
                 spoolDirectory: String, journalPath: String, logPath: String, maxSpoolBytes: Int64 = 20 * 1024 * 1024 * 1024,
                 blockSize: Int = 8 * 1024 * 1024, maxRetries: Int = 4, dailyHour: Int = 2,
                 timeZoneIdentifier: String = TimeZone.current.identifier, allowInsecureLocalHTTP: Bool = false,
-                logMaxBytes: Int64 = 5 * 1024 * 1024, logFileCount: Int = 5) {
+                logMaxBytes: Int64 = 5 * 1024 * 1024, logFileCount: Int = 5,
+                authenticationMode: AzureAuthenticationMode? = nil, storageAccountName: String? = nil,
+                blobEndpoint: String? = nil, azureCliPath: String? = nil, azureCliSubscription: String? = nil) {
         self.connectionString = connectionString; self.container = container; self.prefix = prefix
+        self.authenticationMode = authenticationMode; self.storageAccountName = storageAccountName
+        self.blobEndpoint = blobEndpoint; self.azureCliPath = azureCliPath; self.azureCliSubscription = azureCliSubscription
         self.libraryID = libraryID; self.spoolDirectory = spoolDirectory; self.journalPath = journalPath
         self.logPath = logPath; self.maxSpoolBytes = maxSpoolBytes; self.blockSize = blockSize
         self.maxRetries = maxRetries; self.dailyHour = dailyHour; self.timeZoneIdentifier = timeZoneIdentifier
@@ -43,7 +57,15 @@ public struct AppConfiguration: Codable {
         for path in [spoolDirectory, journalPath, logPath] where !(path.hasPrefix("/") || path.hasPrefix("~/")) {
             throw BackupError.invalidConfiguration("spool, journal, and log paths must be absolute or start with ~/ for LaunchAgent use")
         }
-        _ = try AzureCredentials(connectionString: connectionString, allowInsecureLocalHTTP: allowInsecureLocalHTTP)
+        if let azureCliPath, (!azureCliPath.hasPrefix("/") || azureCliPath.isEmpty) {
+            throw BackupError.invalidConfiguration("azureCliPath must be an absolute path")
+        }
+        if let azureCliSubscription, azureCliSubscription.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw BackupError.invalidConfiguration("azureCliSubscription cannot be empty")
+        }
+        _ = try AzureCredentials(connectionString: connectionString, storageAccountName: storageAccountName,
+                                 blobEndpoint: blobEndpoint, authenticationMode: authenticationMode ?? .connectionString,
+                                 allowInsecureLocalHTTP: allowInsecureLocalHTTP)
     }
 
     public static func load(from url: URL) throws -> AppConfiguration {
@@ -86,10 +108,13 @@ public struct AzureCredentials {
     let accountKey: Data?
     let sasRawQuery: String?
     let endpoint: URL
+    let authenticationMode: AzureAuthenticationMode
 
-    public init(connectionString: String, allowInsecureLocalHTTP: Bool = false) throws {
+    public init(connectionString: String? = nil, storageAccountName: String? = nil, blobEndpoint: String? = nil,
+                authenticationMode: AzureAuthenticationMode = .connectionString,
+                allowInsecureLocalHTTP: Bool = false) throws {
         var values: [String: String] = [:]
-        for part in connectionString.split(separator: ";", omittingEmptySubsequences: true) {
+        for part in (connectionString ?? "").split(separator: ";", omittingEmptySubsequences: true) {
             guard let i = part.firstIndex(of: "=") else { continue }
             values[String(part[..<i])] = String(part[part.index(after: i)...])
         }
@@ -99,15 +124,33 @@ public struct AzureCredentials {
                 ? String(raw.trimmingCharacters(in: .whitespacesAndNewlines).dropFirst())
                 : raw.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        guard let name = values["AccountName"] ?? values["BlobEndpoint"].flatMap(Self.accountNameFromEndpoint), !name.isEmpty,
-              (key != nil && !key!.isEmpty) || (sas != nil && !sas!.isEmpty) else {
-            throw BackupError.invalidConfiguration("connection string must contain a valid AccountKey or SharedAccessSignature plus BlobEndpoint")
-        }
         let endpointText: String
-        if let explicit = values["BlobEndpoint"] { endpointText = explicit }
-        else if let suffix = values["EndpointSuffix"] {
-            endpointText = "\(values["DefaultEndpointsProtocol"] ?? "https")://\(name).blob.\(suffix)"
-        } else { throw BackupError.invalidConfiguration("connection string must specify BlobEndpoint or EndpointSuffix") }
+        let name: String
+        switch authenticationMode {
+        case .connectionString:
+            guard let parsedName = values["AccountName"] ?? values["BlobEndpoint"].flatMap(Self.accountNameFromEndpoint),
+                  !parsedName.isEmpty, (key != nil && !key!.isEmpty) || (sas != nil && !sas!.isEmpty) else {
+                throw BackupError.invalidConfiguration("connectionString authentication requires AccountName and AccountKey or SharedAccessSignature")
+            }
+            name = parsedName
+            if let explicit = values["BlobEndpoint"] { endpointText = explicit }
+            else if let suffix = values["EndpointSuffix"] {
+                endpointText = "\(values["DefaultEndpointsProtocol"] ?? "https")://\(name).blob.\(suffix)"
+            } else { throw BackupError.invalidConfiguration("connectionString authentication requires BlobEndpoint or EndpointSuffix") }
+        case .azureCli:
+            guard connectionString?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true else {
+                throw BackupError.invalidConfiguration("omit connectionString when authenticationMode is azureCli; use storageAccountName and blobEndpoint")
+            }
+            guard key == nil, sas == nil else {
+                throw BackupError.invalidConfiguration("omit AccountKey and SAS when authenticationMode is azureCli")
+            }
+            guard let configuredName = storageAccountName,
+                  configuredName.range(of: "^[a-z0-9]{3,24}$", options: .regularExpression) != nil else {
+                throw BackupError.invalidConfiguration("azureCli authentication requires a valid storageAccountName")
+            }
+            name = configuredName
+            endpointText = blobEndpoint ?? "https://\(name).blob.core.windows.net"
+        }
         guard let endpoint = URL(string: endpointText), let scheme = endpoint.scheme?.lowercased(),
               (scheme == "https" || scheme == "http") else { throw BackupError.invalidConfiguration("invalid Azure Blob endpoint") }
         if scheme == "http" {
@@ -125,6 +168,7 @@ public struct AzureCredentials {
             throw BackupError.invalidConfiguration("SharedAccessSignature is malformed")
         } else { sasQuery = nil }
         self.accountName = name; self.accountKey = key; self.sasRawQuery = sasQuery; self.endpoint = endpoint
+        self.authenticationMode = authenticationMode
     }
 
     private static func accountNameFromEndpoint(_ value: String) -> String? {

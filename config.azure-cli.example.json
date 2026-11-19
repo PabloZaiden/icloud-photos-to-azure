@@ -1,0 +1,21 @@
+{
+  "allowInsecureLocalHTTP": false,
+  "authenticationMode": "azureCli",
+  "azureCliPath": null,
+  "azureCliSubscription": null,
+  "blobEndpoint": "https://replacewithstorageacct.blob.core.windows.net",
+  "blockSize": 8388608,
+  "container": "replace-with-existing-container",
+  "dailyHour": 2,
+  "journalPath": "~/Library/Application Support/PhotosBackup/state/journal.json",
+  "libraryID": "REPLACE_WITH_A_STABLE_UUID",
+  "logFileCount": 5,
+  "logMaxBytes": 5242880,
+  "logPath": "~/Library/Logs/PhotosBackup/backup.log",
+  "maxRetries": 4,
+  "maxSpoolBytes": 21474836480,
+  "prefix": "photos-backup",
+  "spoolDirectory": "~/Library/Application Support/PhotosBackup/Spool",
+  "storageAccountName": "replacewithstorageacct",
+  "timeZoneIdentifier": "America/New_York"
+}

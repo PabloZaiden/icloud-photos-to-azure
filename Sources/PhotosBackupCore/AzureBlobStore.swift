@@ -6,15 +6,22 @@ public final class AzureBlobStore: BlobStore {
     private let container: String
     private let prefix: String
     private let session: URLSession
+    private let azureCliTokenProvider: AzureCliTokenProvider?
     private let apiVersion = "2023-11-03"
 
     public init(configuration: AppConfiguration, session: URLSession = .shared) throws {
         try configuration.validate()
         self.credentials = try AzureCredentials(connectionString: configuration.connectionString,
+                                                storageAccountName: configuration.storageAccountName,
+                                                blobEndpoint: configuration.blobEndpoint,
+                                                authenticationMode: configuration.authenticationMode ?? .connectionString,
                                                 allowInsecureLocalHTTP: configuration.allowInsecureLocalHTTP)
         self.container = configuration.container
         self.prefix = configuration.resolvedPrefix
         self.session = session
+        self.azureCliTokenProvider = configuration.authenticationMode == .azureCli
+            ? AzureCliTokenProvider(executablePath: configuration.azureCliPath, subscription: configuration.azureCliSubscription)
+            : nil
     }
 
     public func blob(_ name: String) async throws -> BlobRecord? {
@@ -151,6 +158,9 @@ public final class AzureBlobStore: BlobStore {
         if let body { request.setValue(String(body.count), forHTTPHeaderField: "Content-Length") }
         if credentials.accountKey != nil {
             request.setValue("SharedKey \(credentials.accountName):\(try signature(request: request, body: body, url: url))", forHTTPHeaderField: "Authorization")
+        } else if credentials.authenticationMode == .azureCli {
+            guard let azureCliTokenProvider else { throw BackupError.storage("Azure CLI authentication is not available") }
+            request.setValue("Bearer \(try azureCliTokenProvider.accessToken())", forHTTPHeaderField: "Authorization")
         }
         let (data, response): (Data, URLResponse)
         do { (data, response) = try await session.data(for: request) }
@@ -206,6 +216,95 @@ public final class AzureBlobStore: BlobStore {
         // URLQueryItem leaves some reserved characters, including '+', literal. Azure
         // decodes '+' as a space in block IDs, so encode every non-RFC3986-unreserved byte.
         part.addingPercentEncoding(withAllowedCharacters: CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.~")) ?? part
+    }
+}
+
+private final class AzureCliTokenProvider {
+    private struct CachedToken {
+        let value: String
+        let refreshAfter: Date
+    }
+
+    private let executablePath: String?
+    private let subscription: String?
+    private let lock = NSLock()
+    private var cachedToken: CachedToken?
+
+    init(executablePath: String?, subscription: String?) {
+        self.executablePath = executablePath
+        self.subscription = subscription
+    }
+
+    func accessToken() throws -> String {
+        lock.lock(); defer { lock.unlock() }
+        if let cachedToken, cachedToken.refreshAfter > Date() { return cachedToken.value }
+        let executable = try resolveExecutable()
+        let process = Process()
+        process.executableURL = executable
+        var arguments = ["account", "get-access-token", "--resource", "https://storage.azure.com/"]
+        if let subscription, !subscription.isEmpty { arguments += ["--subscription", subscription] }
+        arguments += ["--output", "json"]
+        process.arguments = arguments
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        do { try process.run() }
+        catch {
+            throw BackupError.storage("Azure CLI could not start; configure azureCliPath or install Azure CLI and run az login as this macOS user")
+        }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw BackupError.storage("Azure CLI could not get a Blob Storage token (exit code \(process.terminationStatus)); run az login as this macOS user")
+        }
+        guard let response = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rawToken = response["accessToken"] as? String else {
+            throw BackupError.storage("Azure CLI returned an invalid token response; run az login again")
+        }
+        let token = rawToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { throw BackupError.storage("Azure CLI returned an empty Storage token; run az login again") }
+        let now = Date()
+        let expiration = Self.expirationDate(in: response) ?? now.addingTimeInterval(30 * 60)
+        let refreshAfter = min(expiration.addingTimeInterval(-60), now.addingTimeInterval(45 * 60))
+        guard refreshAfter > now else { throw BackupError.storage("Azure CLI returned a Storage token that is about to expire; run az login again") }
+        cachedToken = CachedToken(value: token, refreshAfter: refreshAfter)
+        return token
+    }
+
+    private func resolveExecutable() throws -> URL {
+        let fileManager = FileManager.default
+        if let executablePath {
+            guard fileManager.isExecutableFile(atPath: executablePath) else {
+                throw BackupError.storage("Azure CLI executable is not available at azureCliPath")
+            }
+            return URL(fileURLWithPath: executablePath)
+        }
+        let pathDirectories = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":").map(String.init)
+        let searchDirectories = pathDirectories + ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/usr/bin"]
+        for directory in searchDirectories {
+            let candidate = URL(fileURLWithPath: directory).appendingPathComponent("az").path
+            if fileManager.isExecutableFile(atPath: candidate) { return URL(fileURLWithPath: candidate) }
+        }
+        throw BackupError.storage("Azure CLI executable was not found; install Azure CLI or set azureCliPath")
+    }
+
+    private static func expirationDate(in response: [String: Any]) -> Date? {
+        for key in ["expires_on", "expiresOnTimestamp"] {
+            if let value = response[key] as? NSNumber { return Date(timeIntervalSince1970: value.doubleValue) }
+            if let value = response[key] as? String, let timestamp = Double(value) {
+                return Date(timeIntervalSince1970: timestamp)
+            }
+        }
+        guard let localDate = response["expiresOn"] as? String else { return nil }
+        for format in ["yyyy-MM-dd HH:mm:ss.SSSSSS", "yyyy-MM-dd HH:mm:ss"] {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = .current
+            formatter.dateFormat = format
+            if let date = formatter.date(from: localDate) { return date }
+        }
+        return nil
     }
 }
 
