@@ -15,7 +15,7 @@ struct PhotosBackupCommand {
             case "authorize": try await authorize()
             case "doctor": try await doctor(configURL: args.configURL)
             case "sync": try await sync(args)
-            case "service": try service(args)
+            case "service": try await service(args)
             default: throw BackupError.invalidArgument("unknown command; run photos-backup help")
             }
         } catch {
@@ -91,7 +91,7 @@ struct PhotosBackupCommand {
                           secrets: [connectionString] + privateValues)
     }
 
-    private static func service(_ args: Arguments) throws {
+    private static func service(_ args: Arguments) async throws {
         guard let subcommand = args.positionals.first, ["install", "uninstall", "status"].contains(subcommand) else {
             throw BackupError.invalidArgument("usage: photos-backup service install|uninstall|status [--config PATH]")
         }
@@ -103,6 +103,9 @@ struct PhotosBackupCommand {
         case "install":
             try requirePackagedApp()
             let config = try AppConfiguration.load(from: args.configURL)
+            try await authorize()
+            try await doctor(configURL: args.configURL)
+            try preflightLaunchAgentDirectory()
             let manager = LaunchAgent(config: config, configURL: args.configURL,
                                       executable: Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]),
                                       controller: controller)
@@ -110,6 +113,21 @@ struct PhotosBackupCommand {
             print("LaunchAgent installed and loaded for the current user. It runs daily at hour \(config.dailyHour) in the Mac's local time zone.")
         case "uninstall": try controller.uninstall(); print("LaunchAgent unloaded and removed; backups and configuration were kept.")
         default: print("LaunchAgent \(controller.status)")
+        }
+    }
+
+    private static func preflightLaunchAgentDirectory() throws {
+        let directory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents")
+        let probe = directory.appendingPathComponent(".photos-backup-write-probe-\(UUID().uuidString)")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            try Data().write(to: probe, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: probe.path)
+            try FileManager.default.removeItem(at: probe)
+        } catch {
+            try? FileManager.default.removeItem(at: probe)
+            throw BackupError.permission("the current user cannot write to Library/LaunchAgents; service was not installed")
         }
     }
 
@@ -133,7 +151,9 @@ struct PhotosBackupCommand {
     photos-backup service install|uninstall|status [--config PATH]
 
     With no date filters, sync scans the full Photos library. Date limits are inclusive in the
-    configured time zone. Use the packaged .app executable for Photos authorization.
+    configured time zone. Use the packaged .app executable for Photos authorization. service install
+    requests Photos access, runs doctor against local storage and Azure, and installs the daily LaunchAgent
+    only after preflight succeeds.
     """
 }
 

@@ -1,18 +1,3 @@
 {
-  "allowInsecureLocalHTTP": false,
-  "authenticationMode": "connectionString",
-  "blockSize": 8388608,
-  "connectionString": "REPLACE_WITH_AZURE_CONNECTION_STRING",
-  "container": "replace-with-existing-container",
-  "dailyHour": 2,
-  "journalPath": "~/Library/Application Support/PhotosBackup/state/journal.json",
-  "libraryID": "REPLACE_WITH_A_STABLE_UUID",
-  "logFileCount": 5,
-  "logMaxBytes": 5242880,
-  "logPath": "~/Library/Logs/PhotosBackup/backup.log",
-  "maxRetries": 4,
-  "maxSpoolBytes": 21474836480,
-  "prefix": "photos-backup",
-  "spoolDirectory": "~/Library/Application Support/PhotosBackup/Spool",
-  "timeZoneIdentifier": "America/New_York"
+  "connectionString": "REPLACE_WITH_AZURE_CONNECTION_STRING"
 }

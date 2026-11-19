@@ -13,20 +13,22 @@ Requires macOS 13 or newer, Swift 6, and Xcode command-line tools. The implement
 ```sh
 swift build
 swift test
-scripts/package-app.sh
+bash scripts/package-app.sh
 ```
 
-The package script builds `Photos Backup.app`, adds `NSPhotoLibraryUsageDescription`, signs it, and verifies its signature and property list. It does not install or load a LaunchAgent. By default it uses an ad-hoc signature; for durable macOS Photos permission across app updates, sign each build with the same trusted Developer ID:
+The package script builds `Photos Backup.app`, adds `NSPhotoLibraryUsageDescription`, signs it, and verifies its signature and property list. It does not install or load a LaunchAgent. By default it uses an ad-hoc signature, whose identity changes between builds. The release workflow uses the same self-signed identity and fixed bundle ID on every published release so macOS can recognize the app across updates:
 
 ```sh
-CODE_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" scripts/package-app.sh
+CODE_SIGN_IDENTITY="Photos Backup Release Signing" bash scripts/package-app.sh
 ```
 
-Move the packaged app to its permanent path before authorizing Photos or installing the service. macOS associates privacy approval with the app identity. Run commands from `Photos Backup.app/Contents/MacOS/photos-backup` or a shell alias to that executable.
+Self-signed releases are not notarized and do not satisfy Gatekeeper's trusted-developer check; macOS may require a manual Open approval for downloaded releases. Use the release artifact for the installed service and keep the same signing certificate and bundle identifier. Move the packaged app to its permanent path before authorizing Photos or installing the service. macOS tracks privacy access using the app's designated code requirement. Run commands from `Photos Backup.app/Contents/MacOS/photos-backup` or a shell alias to that executable.
+
+Publishing a GitHub release starts `.github/workflows/release-macos.yml`. It builds and tests on an arm64 macOS runner, verifies the stable signing identity, and attaches the fixed-name `Photos-Backup-macos-arm64.zip`. The workflow needs repository Actions secrets `PHOTOS_BACKUP_SIGNING_IDENTITY_P12_BASE64` and `PHOTOS_BACKUP_SIGNING_P12_PASSWORD`; the signing key is not stored in git. GitHub secrets are available to trusted repository workflows, not pull requests from forks. Do not print or commit the P12 or password.
 
 ## Configure
 
-Create the private application support directory and copy one example. Fill in the stable library UUID, existing container, and preferred prefix. Never put credentials in command arguments or commit a real config file.
+Create the private application support directory and copy the example for the authentication method you want. The file needs exactly one value: a connection string or a storage account name for Azure CLI.
 
 ```sh
 mkdir -p "$HOME/Library/Application Support/PhotosBackup"
@@ -53,34 +55,27 @@ The client preserves SAS percent escapes in the signed URL query. It sends a Sha
 
 ### Use the signed-in Azure CLI session
 
-To avoid storing a key or SAS, copy `config.azure-cli.example.json` instead. It contains only the storage account name, Blob endpoint, container, and prefix. Then sign in once with Azure CLI if needed:
+To avoid storing a key or SAS, copy `config.azure-cli.example.json` instead and enter the storage account name. The app infers Azure CLI authentication and the standard Blob endpoint. Then sign in once with Azure CLI if needed:
 
 ```sh
 az login
 az account show --output table
 ```
 
-Set `authenticationMode` to `azureCli`. The app asks `az account get-access-token` for a token scoped to Azure Storage, keeps it in memory, and refreshes it before expiry. It does not write the token to config, journal, or logs. Azure CLI persists the signed-in account's refresh credentials for later token requests; the daily LaunchAgent must run as the same macOS user. [Azure CLI documents token expiry and recommends the UTC `expires_on` field](https://learn.microsoft.com/en-us/cli/azure/account?view=azure-cli-latest#az-account-get-access-token), and [how `az login` stores and refreshes the signed-in session](https://learn.microsoft.com/en-us/cli/azure/authenticate-azure-cli-interactively).
+The app asks `az account get-access-token` for a token scoped to Azure Storage, keeps it in memory, and refreshes it before expiry. It does not write the token to config, journal, or logs. Azure CLI persists the signed-in account's refresh credentials for later token requests; the daily LaunchAgent must run as the same macOS user. If the storage account is in another subscription, select it in the CLI first with `az account set --subscription ...`. [Azure CLI documents token expiry and recommends the UTC `expires_on` field](https://learn.microsoft.com/en-us/cli/azure/account?view=azure-cli-latest#az-account-get-access-token), and [how `az login` stores and refreshes the signed-in session](https://learn.microsoft.com/en-us/cli/azure/authenticate-azure-cli-interactively).
 
 Grant the signed-in user **Storage Blob Data Contributor** on the target container or storage account. Azure management roles such as `Owner` by themselves do not grant blob data access. [Microsoft's Blob authorization guide describes the data roles](https://learn.microsoft.com/en-us/azure/storage/blobs/authorize-access-azure-active-directory).
 
-Set `azureCliSubscription` only when the storage account belongs to a subscription other than the active Azure CLI subscription. Set `azureCliPath` to the absolute `az` executable path if LaunchAgent cannot find it on `PATH`; the app checks common Homebrew paths too. If Azure CLI asks for sign-in again, run `az login` as the same user and rerun `doctor`.
+The app finds `az` on `PATH` and common Homebrew paths. If Azure CLI asks for sign-in again, run `az login` as the same user and rerun `doctor`.
 
-For AccountKey or SAS, use `config.example.json`. Scope SAS to the configured container and prefix with the operations needed to list/read blob metadata, stage and commit blocks, update metadata, and delete the temporary doctor probe. The container must already exist for normal backups. Config files require mode `0600` or stricter. The journal, spool, logs, run lock, and LaunchAgent property list are also private to the user.
+For AccountKey or SAS, use `config.example.json`. Scope SAS to the `photos-backup` container with the operations needed to list/read blob metadata, stage and commit blocks, update metadata, and delete the temporary doctor probe. That container must already exist. Config files require mode `0600` or stricter. The app stores its generated library ID and internal runtime defaults privately under Application Support; the journal, spool, logs, run lock, and LaunchAgent property list are also private to the user.
 
-Important config values:
+The JSON has one user setting:
 
-- `libraryID`: a stable, unique UUID for this Photos library. Keep it across runs and app reinstalls.
-- `authenticationMode`: `connectionString` for AccountKey/SAS, or `azureCli` to use the active user's signed-in Azure CLI session.
-- `connectionString`: required only for `connectionString` mode; omit it in Azure CLI mode.
-- `storageAccountName`, `blobEndpoint`: non-secret Azure storage location fields for `azureCli`. The standard endpoint is inferred from the account name if `blobEndpoint` is omitted.
-- `azureCliSubscription`, `azureCliPath`: optional subscription selector and absolute path to the `az` executable.
-- `container`, `prefix`: destination location. A prefix scopes all manifests and content objects.
-- `spoolDirectory`, `journalPath`, `logPath`: absolute paths or `~/` paths so launchd resolves them the same way as Terminal.
-- `maxSpoolBytes`: maximum space retained for complete exports waiting for Azure. The current default is 20 GiB; choose a value that fits available disk space.
-- `blockSize`: Azure upload block size (64 KiB to 100 MiB). The engine raises it when necessary to stay below Azure's 50,000 block limit.
-- `timeZoneIdentifier`, `dailyHour`: filter calendar and LaunchAgent schedule. The LaunchAgent runs at minute zero in the Mac's local clock.
-- `allowInsecureLocalHTTP`: set `true` only in a development config for a loopback emulator.
+- `connectionString`: AccountKey or SAS authentication, or
+- `storageAccountName`: Azure CLI authentication using the active signed-in account.
+
+Do not include both. The app uses the existing `photos-backup` container and the `photos-backup` namespace prefix. It creates and retains a stable library ID on first use, and sets paths, spool limit (20 GiB), block size, retries, log rotation, and a daily 2:00 AM schedule internally. Date filters use the Mac's current time zone. When it sees an older expanded config, the app migrates its destination, library ID, and operational values to private internal state, then rewrites the user config to just the authentication value.
 
 ## Authorize and check
 
@@ -102,7 +97,7 @@ photos-backup sync --to 2024-12-31
 photos-backup sync --from 2024-01-01 --to 2024-12-31 --dry-run
 ```
 
-With no dates, the command enumerates the full accessible library on every run; it does not use a last-run watermark. Dates use the Photos capture date in `timeZoneIdentifier`, and both ends are inclusive. Missing capture dates are included only without a filter; with a filter, they are reported as unclassifiable and the run exits nonzero. A dry run queries Photos inventory and Azure manifests but does not export/download resources, write blobs, update manifests, or clear recovery state. It reports `would upload` candidates; a changed source date may need export/hash comparison in a real run, so this is an estimate.
+With no dates, the command enumerates the full accessible library on every run; it does not use a last-run watermark. Dates use the Photos capture date in the Mac's current time zone, and both ends are inclusive. Missing capture dates are included only without a filter; with a filter, they are reported as unclassifiable and the run exits nonzero. A dry run queries Photos inventory and Azure manifests but does not export/download resources, write blobs, update manifests, or clear recovery state. It reports `would upload` candidates; a changed source date may need export/hash comparison in a real run, so this is an estimate.
 
 Each `PHAssetResource` original is considered independently, including photo/video components of Live Photos, alternate RAW/JPEG resources, audio, and hidden assets. The current representation prefers Photos' full-size rendered photo, video, or paired-video resource. If that resource is absent, the app asks Photos for its current rendered editing input (and a current Live Photo for the motion component) with network access enabled. When the asset has no edits, the original is the current representation. If Photos cannot supply a current render, the resource fails visibly instead of backing up the wrong bytes.
 
@@ -120,7 +115,7 @@ The Azure container holds three forms of blob:
 
 Blob metadata records the identity hash, representation, source date, file name/type, object name, size, schema, and content hash. A local cache never proves that an Azure object still exists. Remote writes use ETags and conditional creation/update; concurrent changes are re-read rather than overwritten blindly. If the Photos source date is missing, the content is exported and rehashed each run. A dated Azure version newer than a local dated version is preserved. If the local date is unknown and the bytes differ from a dated destination, the run reports a conflict.
 
-Exports are streamed to a private spool file one resource at a time and SHA-256 is computed in bounded memory. The journal is atomically persisted before export and after each completed block checkpoint. After a crash, the next process verifies the retained file and origin, checks Azure's uncommitted block list, and sends only missing blocks for the exact content hash and segmentation. Block IDs include the block size, so changing segmentation cannot combine versions. If a commit response is lost, the client checks the committed blob before retrying. Azure may expire uncommitted blocks after about a week without successful operations; the spool is retained within `maxSpoolBytes`, but expired blocks must be sent again. Completed objects stay backed up even when another resource fails.
+Exports are streamed to a private spool file one resource at a time and SHA-256 is computed in bounded memory. The journal is atomically persisted before export and after each completed block checkpoint. After a crash, the next process verifies the retained file and origin, checks Azure's uncommitted block list, and sends only missing blocks for the exact content hash and segmentation. Block IDs include the block size, so changing segmentation cannot combine versions. If a commit response is lost, the client checks the committed blob before retrying. Azure may expire uncommitted blocks after about a week without successful operations; the internal spool limit is 20 GiB, and expired blocks must be sent again. Completed objects stay backed up even when another resource fails.
 
 When a journal is corrupt or lost, untracked spool files are discarded conservatively; the next sync re-exports and Azure block IDs allow any still-present identical blocks to be reused. Interrupted partial exports are discarded. The journal does not store Azure credentials. Failures leave resources pending for a later run and produce a nonzero exit status.
 
@@ -136,11 +131,19 @@ photos-backup service status --config "$HOME/Library/Application Support/PhotosB
 photos-backup service uninstall --config "$HOME/Library/Application Support/PhotosBackup/config.json"
 ```
 
-`install` writes and loads only this user's `com.photosbackup.daily` LaunchAgent. It runs daily at the configured hour and minute `00` while the user is logged in. launchd may run a missed calendar event after wake; the Mac must be powered on and the user session available. It is not a daemon that runs while logged out. Uninstalling unloads/removes only the plist and keeps config, journal, logs, spool, and remote blobs. Standard error goes to `<logPath>.launchd`; application logs rotate by configured size/count.
+`install` first requests full Photos access if needed, checks the local spool and performs `doctor`'s Azure write/read/delete probe. It checks that the current user can write the LaunchAgents directory, then installs and loads the job only if all preflight checks pass. A denied Photos permission or failed Azure check leaves the service uninstalled. The job runs daily at 2:00 AM local time while the user is logged in; it does not start a backup immediately when installed. launchd may run a missed calendar event after wake; the Mac must be powered on and the user session available. It is not a daemon that runs while logged out. Uninstalling unloads/removes only the plist and keeps config, journal, logs, spool, and remote blobs. Standard error goes to `<logPath>.launchd`; application logs rotate by internal defaults.
 
 ## Tests
 
 The regular suite uses fixture PhotoKit and a fake BlobStore. It covers date boundaries and DST, hidden/burst selection policy, object/manifest behavior, edits and reverts, missing remote objects, ETag conflicts, partial blocks across new engine instances, changed block sizing, changed source bytes, corrupted/lost checkpoints, disk limits, lost commit replies, and Azure CLI bearer-token acquisition/caching without exposing CLI stderr.
+
+The Azure CLI integration test is opt-in. Its private config needs only `storageAccountName`; it uploads synthetic bytes under a unique name, exercises block reconciliation/commit/download/conditional writes, and cleans up its blobs:
+
+```sh
+PHOTOS_BACKUP_RUN_AZURE_CLI=1 \
+PHOTOS_BACKUP_AZURECLI_INTEGRATION_CONFIG="$HOME/Library/Application Support/PhotosBackup/azure-cli-test.json" \
+swift test --filter AzureBlobStoreTests/testAzureCliBlockUploadIsAvailableAsOptInIntegration
+```
 
 The Azurite test is opt-in and uses the public development-only account key against loopback only. It creates a local test container if needed and exercises Shared Key authentication, block list reconciliation, commit, metadata, download, and conditional writes:
 
