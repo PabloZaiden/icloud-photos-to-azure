@@ -417,7 +417,13 @@ public final class PhotoKitLibrary: PhotoLibrary {
         String(SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined().prefix(20))
     }
     private static func filename(_ resource: PHAssetResource) -> String {
-        if #available(macOS 27, *) { return resource.filename ?? resource.originalFilename }
+        // macOS 27 adds a nullable filename property. Query it dynamically so this
+        // target still builds with the macOS 26 SDK used by the stable release runner.
+        let filenameSelector = Selector(("filename"))
+        if #available(macOS 27, *), resource.responds(to: filenameSelector),
+           let filename = resource.perform(filenameSelector)?.takeUnretainedValue() as? String {
+            return filename
+        }
         return resource.originalFilename
     }
     private static func item(libraryID: String, asset: PHAsset, resourceID: String, resourceKind: String,
