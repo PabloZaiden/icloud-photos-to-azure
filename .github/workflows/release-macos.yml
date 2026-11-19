@@ -14,6 +14,7 @@ concurrency:
 jobs:
   build-and-upload:
     runs-on: macos-latest
+    timeout-minutes: 20
     steps:
       - name: Check out release tag
         uses: actions/checkout@v6
@@ -36,20 +37,36 @@ jobs:
           P12_PATH="$RUNNER_TEMP/photos-backup-signing.p12"
           printf '%s' "$SIGNING_CERTIFICATE_BASE64" | base64 -D > "$P12_PATH"
           chmod 600 "$P12_PATH"
+          {
+            printf 'PHOTOS_BACKUP_KEYCHAIN_PATH=%s\n' "$KEYCHAIN_PATH"
+            printf 'PHOTOS_BACKUP_P12_PATH=%s\n' "$P12_PATH"
+          } >> "$GITHUB_ENV"
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security default-keychain -d user -s "$KEYCHAIN_PATH" >/dev/null
-          swift scripts/import-signing-identity.swift "$P12_PATH"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          security import "$P12_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$PHOTOS_BACKUP_SIGNING_P12_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          if ! security find-identity -v -p codesigning "$KEYCHAIN_PATH" 2>/dev/null | grep -Fq '"Photos Backup Release Signing"'; then
+            echo "Signing identity is not available in the temporary keychain" >&2
+            exit 1
+          fi
           security list-keychains -d user -s "$KEYCHAIN_PATH" >/dev/null
 
-          echo "PHOTOS_BACKUP_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          SIGNING_IDENTITY="$(security find-certificate -a -Z "$KEYCHAIN_PATH" \
+            | awk '/^SHA-1 hash:/ && !found { print $3; found=1 }')"
+          if [[ -z "$SIGNING_IDENTITY" ]]; then
+            echo "No imported signing certificate fingerprint was found" >&2
+            security find-certificate -a -Z "$KEYCHAIN_PATH" >&2 || true
+            exit 1
+          fi
+          printf 'CODE_SIGN_IDENTITY=%s\n' "$SIGNING_IDENTITY" >> "$GITHUB_ENV"
 
       - name: Test, package, and verify signature
-        env:
-          CODE_SIGN_IDENTITY: Photos Backup Release Signing
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           swift test --scratch-path "$RUNNER_TEMP/photos-backup-tests"
@@ -95,4 +112,6 @@ jobs:
           if [[ -n "${PHOTOS_BACKUP_KEYCHAIN_PATH:-}" ]]; then
             security delete-keychain "$PHOTOS_BACKUP_KEYCHAIN_PATH" >/dev/null 2>&1 || true
           fi
-          rm -f "$RUNNER_TEMP/photos-backup-signing.p12"
+          if [[ -n "${PHOTOS_BACKUP_P12_PATH:-}" ]]; then
+            rm -f "$PHOTOS_BACKUP_P12_PATH"
+          fi
