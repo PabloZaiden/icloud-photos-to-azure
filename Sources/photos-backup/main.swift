@@ -193,11 +193,6 @@ struct PhotosBackupCommand {
     photo-backup doctor [--config PATH]
     photo-backup sync [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--dry-run] [--config PATH]
     photo-backup service install|uninstall|status [--config PATH]
-
-    With no date filters, sync scans the full Photos library. Date limits are inclusive in the
-    configured time zone. The release is one signed executable with embedded Photos permission metadata. service install
-    requests Photos access, runs doctor against local storage and Azure, and registers this executable as the daily LaunchAgent
-    only after preflight succeeds.
     """
 }
 
