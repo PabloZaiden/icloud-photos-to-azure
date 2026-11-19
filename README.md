@@ -13,26 +13,20 @@ Requires macOS 13 or newer, Swift 6, and Xcode command-line tools. The implement
 ```sh
 swift build
 swift test
-bash scripts/package-app.sh
+swift build --configuration release --product photo-backup
 ```
 
-The package script builds `Photos Backup.app`, adds `NSPhotoLibraryUsageDescription`, signs it, and verifies its signature and property list. It does not install or load a LaunchAgent. By default it uses an ad-hoc signature, whose identity changes between builds. The release workflow uses the same self-signed identity and fixed bundle ID on every published release so macOS can recognize the app across updates:
+The release is one raw executable named `photo-backup-macos-arm64`; it contains the Photos permission description and stable bundle identifier in its Mach-O `__info_plist` section. It is code-signed with the same self-signed identity on each release, so macOS can recognize the executable across updates. [Apple documents embedded Info.plist sections for command-line tools](https://developer.apple.com/documentation/xcode/build-settings-reference) and the [required Photos usage-description key](https://developer.apple.com/documentation/bundleresources/information-property-list/nsphotolibraryusagedescription).
+
+Download that single file from the latest GitHub release, put it at a stable path, and make it executable:
 
 ```sh
-CODE_SIGN_IDENTITY="Photos Backup Release Signing" bash scripts/package-app.sh
+mkdir -p ~/.local/bin
+curl -fL https://github.com/PabloZaiden/icloud-photos-to-azure/releases/latest/download/photo-backup-macos-arm64 -o ~/.local/bin/photo-backup
+chmod 755 ~/.local/bin/photo-backup
 ```
 
-The `.app` is a headless permission bundle, not a graphical interface. Photos requires an `NSPhotoLibraryUsageDescription` entry in the app's Info.plist; the installer keeps the signed bundle at a stable path and adds the `photo-backup` command to zsh's PATH. [Apple documents the required usage-description key](https://developer.apple.com/documentation/bundleresources/information-property-list/nsphotolibraryusagedescription).
-
-Self-signed releases are not notarized and do not satisfy Gatekeeper's trusted-developer check; macOS may require a manual Open approval for downloaded releases. After extracting the release ZIP, install the command once from its `Photos-Backup` folder:
-
-```sh
-bash install-cli.sh
-```
-
-Open a new Terminal window. The script installs the app in `~/Applications/Photos Backup.app`, installs `photo-backup` in `~/.local/bin`, and adds that directory to `~/.zprofile`.
-
-Publishing a GitHub release starts `.github/workflows/release-macos.yml`. It builds and tests on an arm64 macOS runner, verifies the stable signing identity, and attaches the fixed-name `Photos-Backup-macos-arm64.zip`. The workflow needs repository Actions secrets `PHOTOS_BACKUP_SIGNING_IDENTITY_P12_BASE64` and `PHOTOS_BACKUP_SIGNING_P12_PASSWORD`; the signing key is not stored in git. GitHub secrets are available to trusted repository workflows, not pull requests from forks. Do not print or commit the P12 or password.
+Self-signed releases are not notarized and do not satisfy Gatekeeper's trusted-developer check; macOS may ask you to approve the downloaded executable. Publishing a GitHub release starts `.github/workflows/release-macos.yml`. It builds and tests on an arm64 macOS runner, signs and verifies the standalone binary, and attaches only `photo-backup-macos-arm64`. The workflow needs repository Actions secrets `PHOTOS_BACKUP_SIGNING_IDENTITY_P12_BASE64` and `PHOTOS_BACKUP_SIGNING_P12_PASSWORD`; the signing key is not stored in git. GitHub secrets are available to trusted repository workflows, not pull requests from forks. Do not print or commit the P12 or password.
 
 ## Run
 
@@ -48,9 +42,9 @@ photo-backup sync
 photo-backup service install
 ```
 
-`config` creates the private config automatically. For AccountKey or SAS instead, run `photo-backup config --connection-string`; it prompts with input hidden. The app uses the existing `photos-backup` container and prefix, so neither belongs in the config. The active Azure CLI subscription is used; run `az account set --subscription ...` first only if needed.
+`config` creates the private config automatically. For AccountKey or SAS instead, run `photo-backup config --connection-string`; it prompts with input hidden. The executable uses the existing `photos-backup` container and prefix, so neither belongs in the config. The active Azure CLI subscription is used; run `az account set --subscription ...` first only if needed.
 
-Azure CLI asks for a token scoped to Storage, keeps it in memory, and refreshes it before expiry. It does not write the token to config, journal, or logs. Azure CLI persists the signed-in account's refresh credentials for later token requests; the daily LaunchAgent runs as that same macOS user. The app finds `az` on `PATH` and common Homebrew paths. [Azure CLI documents token expiry and how `az login` stores the session](https://learn.microsoft.com/en-us/cli/azure/authenticate-azure-cli-interactively).
+Azure CLI asks for a token scoped to Storage, keeps it in memory, and refreshes it before expiry. It does not write the token to config, journal, or logs. Azure CLI persists the signed-in account's refresh credentials for later token requests; the daily LaunchAgent runs as that same macOS user. The executable finds `az` on `PATH` and common Homebrew paths. [Azure CLI documents token expiry and how `az login` stores the session](https://learn.microsoft.com/en-us/cli/azure/authenticate-azure-cli-interactively).
 
 The storage account must have an existing `photos-backup` container. The signed-in user needs **Storage Blob Data Contributor** on the container or account; Azure management roles such as `Owner` by themselves do not grant blob data access. [Microsoft documents the Blob data roles](https://learn.microsoft.com/en-us/azure/storage/blobs/authorize-access-azure-active-directory). Config files and internal settings are written with mode `0600`; runtime paths, limits, retries, logging, library ID, and daily 2:00 AM schedule use private defaults.
 
@@ -76,7 +70,7 @@ photo-backup sync --from 2024-01-01 --to 2024-12-31 --dry-run
 
 With no dates, the command enumerates the full accessible library on every run; it does not use a last-run watermark. Dates use the Photos capture date in the Mac's current time zone, and both ends are inclusive. Missing capture dates are included only without a filter; with a filter, they are reported as unclassifiable and the run exits nonzero. A dry run queries Photos inventory and Azure manifests but does not export/download resources, write blobs, update manifests, or clear recovery state. It reports `would upload` candidates; a changed source date may need export/hash comparison in a real run, so this is an estimate.
 
-Each `PHAssetResource` original is considered independently, including photo/video components of Live Photos, alternate RAW/JPEG resources, audio, and hidden assets. The current representation prefers Photos' full-size rendered photo, video, or paired-video resource. If that resource is absent, the app asks Photos for its current rendered editing input (and a current Live Photo for the motion component) with network access enabled. When the asset has no edits, the original is the current representation. If Photos cannot supply a current render, the resource fails visibly instead of backing up the wrong bytes.
+Each `PHAssetResource` original is considered independently, including photo/video components of Live Photos, alternate RAW/JPEG resources, audio, and hidden assets. The current representation prefers Photos' full-size rendered photo, video, or paired-video resource. If that resource is absent, the executable asks Photos for its current rendered editing input (and a current Live Photo for the motion component) with network access enabled. When the asset has no edits, the original is the current representation. If Photos cannot supply a current render, the resource fails visibly instead of backing up the wrong bytes.
 
 Resource identity uses the Photos asset local identifier, representation, resource kind, and a digest of the UTI. Filename and enumeration order are not identity. If one asset contains multiple indistinguishable resources with the same kind and UTI, the run flags incomplete coverage and skips those resources rather than assigning unstable ordinals. Local identifiers are specific to one Photos library and are not cross-Mac deduplication IDs.
 

@@ -63,7 +63,7 @@ struct PhotosBackupCommand {
 
     private static func authorize() async throws {
         #if canImport(Photos)
-        try requirePackagedApp()
+        try requirePhotoLibraryMetadata()
         let library = PhotoKitLibrary(libraryID: "authorization")
         var state = library.authorization()
         if state == "not-determined" { state = await library.requestAuthorization() }
@@ -77,7 +77,7 @@ struct PhotosBackupCommand {
     }
 
     private static func doctor(configURL: URL) async throws {
-        try requirePackagedApp()
+        try requirePhotoLibraryMetadata()
         let config = try AppConfiguration.load(from: configURL)
         let logger = loggerFor(config)
         let library = PhotoKitLibrary(libraryID: config.libraryID)
@@ -95,7 +95,7 @@ struct PhotosBackupCommand {
     }
 
     private static func sync(_ args: Arguments) async throws {
-        try requirePackagedApp()
+        try requirePhotoLibraryMetadata()
         let config = try AppConfiguration.load(from: args.configURL)
         let log = loggerFor(config)
         let timeZone = TimeZone(identifier: config.timeZoneIdentifier)!
@@ -134,13 +134,13 @@ struct PhotosBackupCommand {
         let controller = LaunchAgentController(label: label, domain: domain, plistURL: plistURL, runner: runLaunchctl)
         switch subcommand {
         case "install":
-            try requirePackagedApp()
+            try requirePhotoLibraryMetadata()
             let config = try AppConfiguration.load(from: args.configURL)
             try await authorize()
             try await doctor(configURL: args.configURL)
             try preflightLaunchAgentDirectory()
             let manager = LaunchAgent(config: config, configURL: args.configURL,
-                                      executable: Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]),
+                                      executable: currentExecutableURL(),
                                       controller: controller)
             try manager.install()
             print("LaunchAgent installed and loaded for the current user. It runs daily at hour \(config.dailyHour) in the Mac's local time zone.")
@@ -170,10 +170,20 @@ struct PhotosBackupCommand {
         do { try process.run(); process.waitUntilExit(); return process.terminationStatus } catch { return -1 }
     }
 
-    private static func requirePackagedApp() throws {
-        guard Bundle.main.bundleURL.pathExtension == "app",
+    private static func currentExecutableURL() -> URL {
+        var buffer = [CChar](repeating: 0, count: 4096)
+        var bufferSize = UInt32(buffer.count)
+        guard _NSGetExecutablePath(&buffer, &bufferSize) == 0 else {
+            return URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+        }
+        let path = String(decoding: buffer.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        return URL(fileURLWithPath: path).standardizedFileURL
+    }
+
+    private static func requirePhotoLibraryMetadata() throws {
+        guard Bundle.main.bundleIdentifier == "com.photosbackup.cli",
               Bundle.main.infoDictionary?["NSPhotoLibraryUsageDescription"] as? String != nil else {
-            throw BackupError.permission("install the headless Photos Backup app with install-cli.sh, then run photo-backup again")
+            throw BackupError.permission("this photo-backup executable is missing its embedded Photos permission metadata; download the signed release binary")
         }
     }
 
@@ -185,8 +195,8 @@ struct PhotosBackupCommand {
     photo-backup service install|uninstall|status [--config PATH]
 
     With no date filters, sync scans the full Photos library. Date limits are inclusive in the
-    configured time zone. The installed command uses a headless app bundle for Photos permission; no GUI is shown. service install
-    requests Photos access, runs doctor against local storage and Azure, and installs the daily LaunchAgent
+    configured time zone. The release is one signed executable with embedded Photos permission metadata. service install
+    requests Photos access, runs doctor against local storage and Azure, and registers this executable as the daily LaunchAgent
     only after preflight succeeds.
     """
 }
