@@ -62,44 +62,37 @@ jobs:
           fi
           printf 'CODE_SIGN_IDENTITY=%s\n' "$SIGNING_IDENTITY" >> "$GITHUB_ENV"
 
-      - name: Test, package, and verify signature
+      - name: Test, build, and verify signed binary
         timeout-minutes: 10
         run: |
           set -euo pipefail
           swift test --scratch-path "$RUNNER_TEMP/photos-backup-tests"
-          bash scripts/package-app.sh "$RUNNER_TEMP/photos-backup-package"
+          BINARY="$RUNNER_TEMP/photo-backup-macos-arm64"
+          bash scripts/package-binary.sh "$BINARY"
 
-          APP="$RUNNER_TEMP/photos-backup-package/Photos Backup.app"
-          EXECUTABLE="$APP/Contents/MacOS/photos-backup"
           SIGNATURE_INFO="$RUNNER_TEMP/photos-backup-signature.txt"
           REQUIREMENT_INFO="$RUNNER_TEMP/photos-backup-requirement.txt"
-          codesign --verify --deep --strict "$APP"
-          codesign -dv --verbose=4 "$APP" > "$SIGNATURE_INFO" 2>&1
-          codesign -d -r - "$APP" > "$REQUIREMENT_INFO" 2>&1
+          codesign --verify --strict --verbose=2 "$BINARY"
+          codesign -dv --verbose=4 "$BINARY" > "$SIGNATURE_INFO" 2>&1
+          codesign -d -r - "$BINARY" > "$REQUIREMENT_INFO" 2>&1
           grep -Fq "Authority=Photos Backup Release Signing" "$SIGNATURE_INFO"
           grep -Fq 'identifier "com.photosbackup.cli"' "$REQUIREMENT_INFO"
           if grep -qi 'cdhash' "$REQUIREMENT_INFO"; then
-            echo "The app has a build-specific designated requirement" >&2
+            echo "The binary has a build-specific designated requirement" >&2
             exit 1
           fi
-          if [[ "$(lipo -archs "$EXECUTABLE")" != "arm64" ]]; then
-            echo "Expected the arm64 release executable" >&2
+          if [[ "$(lipo -archs "$BINARY")" != "arm64" ]]; then
+            echo "Expected the arm64 release binary" >&2
             exit 1
           fi
 
-          RELEASE_DIR="$RUNNER_TEMP/Photos-Backup"
-          mkdir -p "$RELEASE_DIR"
-          ditto "$APP" "$RELEASE_DIR/Photos Backup.app"
-          install -m 755 install-cli.sh "$RELEASE_DIR/install-cli.sh"
-          ditto -c -k --sequesterRsrc --keepParent "$RELEASE_DIR" "$RUNNER_TEMP/Photos-Backup-macos-arm64.zip"
-
-      - name: Attach ZIP to published release
+      - name: Attach binary to published release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/Photos-Backup-macos-arm64.zip" \
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/photo-backup-macos-arm64" \
             --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Remove signing keychain

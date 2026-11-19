@@ -5,23 +5,19 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>photos-backup</string>
+	<string>photo-backup</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.photosbackup.cli</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Photos Backup</string>
-	<key>CFBundlePackageType</key>
-	<string>APPL</string>
+	<string>photo-backup</string>
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
-	<key>LSUIElement</key>
-	<true/>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Photos Backup reads your Photos library to back up original and currently edited resources to the Azure destination you configure.</string>
 </dict>

@@ -5,9 +5,9 @@ final class LaunchAgentDefinitionTests: XCTestCase {
     func testScheduleUsesMinuteZeroAndExplicitConfigPath() throws {
         let config = URL(fileURLWithPath: "/tmp/private/config/custom.json")
         let log = URL(fileURLWithPath: "/tmp/private/logs/backup.log")
-        let plist = try LaunchAgentDefinition.propertyList(label: "com.example.photos", executable: URL(fileURLWithPath: "/Applications/Photos Backup.app/Contents/MacOS/photos-backup"),
+        let plist = try LaunchAgentDefinition.propertyList(label: "com.example.photos", executable: URL(fileURLWithPath: "/Users/example/.local/bin/photo-backup"),
                                                            config: config, hour: 2, log: log)
-        XCTAssertEqual(plist["ProgramArguments"] as? [String], ["/Applications/Photos Backup.app/Contents/MacOS/photos-backup", "sync", "--config", config.path])
+        XCTAssertEqual(plist["ProgramArguments"] as? [String], ["/Users/example/.local/bin/photo-backup", "sync", "--config", config.path])
         XCTAssertEqual(plist["StartCalendarInterval"] as? [String: Int], ["Hour": 2, "Minute": 0])
         XCTAssertEqual(plist["StandardErrorPath"] as? String, log.path + ".launchd")
         XCTAssertEqual(plist["RunAtLoad"] as? Bool, false)
