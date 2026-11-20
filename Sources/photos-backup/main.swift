@@ -70,6 +70,7 @@ struct PhotosBackupCommand {
         guard state == "authorized" else {
             throw BackupError.permission("full Photos access is required; current status is \(state). If macOS did not show a prompt, enable access in System Settings > Privacy & Security > Photos and rerun photo-backup authorize")
         }
+        try library.checkAvailability()
         print("Photos access is authorized.")
         #else
         throw BackupError.permission("PhotoKit is available only on macOS")
@@ -81,35 +82,30 @@ struct PhotosBackupCommand {
         let config = try AppConfiguration.load(from: configURL)
         let logger = loggerFor(config)
         let library = PhotoKitLibrary(libraryID: config.libraryID)
-        guard library.authorization() == "authorized" else {
-            throw BackupError.permission("full read access is required; run photo-backup authorize (status: \(library.authorization()))")
-        }
-        let spool = config.resolve(config.spoolDirectory)
-        try FileManager.default.createDirectory(at: spool, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        guard FileManager.default.isWritableFile(atPath: spool.path) else { throw BackupError.storage("spool directory is not writable") }
+        try library.checkAvailability()
         let store = try AzureBlobStore(configuration: config)
+        _ = try OriginalsMirror(library: library, configuration: config, store: store, logger: logger)
         try await store.probe(prefix: "doctor")
-        logger.info("Doctor completed: Photos authorization, local spool write access, and Azure probe write/read/delete passed")
-        print("Doctor passed: Photos is authorized, local spool is writable, and an isolated Azure probe was written, read, and deleted.")
-        print("Doctor does not verify export fidelity, full-library coverage, Azure retention, or a real backup.")
+        logger.info("Doctor completed: system Photos library access and Azure probe passed")
+        print("Doctor passed: Photos is authorized, the system library is available, and an isolated Azure probe passed.")
     }
 
     private static func sync(_ args: Arguments) async throws {
         try requirePhotoLibraryMetadata()
         let config = try AppConfiguration.load(from: args.configURL)
         let log = loggerFor(config)
+        prepareLaunchAgentOutput(log)
         let timeZone = TimeZone(identifier: config.timeZoneIdentifier)!
         let filter = try DateFilter(from: args.from, to: args.to, timeZone: timeZone)
         let lockURL = config.resolve(config.journalPath).deletingLastPathComponent().appendingPathComponent("sync.lock")
         let lock = try RunLock(url: lockURL)
         defer { withExtendedLifetime(lock) {} }
         let library = PhotoKitLibrary(libraryID: config.libraryID)
+        try library.checkAvailability()
         let store = try AzureBlobStore(configuration: config)
-        let engine = try BackupEngine(configuration: config, library: library, store: store, logger: log)
-        let summary = await engine.sync(filter: filter, dryRun: args.dryRun)
-        print("\(summary.dryRun ? "DRY RUN — " : "")examined \(summary.examined), skipped \(summary.skipped), would upload \(summary.wouldUpload), uploaded \(summary.uploaded), resumed \(summary.resumed), pending \(summary.pending), failed \(summary.failed), undated assets \(summary.unclassifiableAssets), transferred \(summary.bytesTransferred) bytes, reused \(summary.bytesReused) bytes")
-        log.info("Sync completed: examined=\(summary.examined) skipped=\(summary.skipped) would_upload=\(summary.wouldUpload) uploaded=\(summary.uploaded) resumed=\(summary.resumed) pending=\(summary.pending) failed=\(summary.failed) bytes=\(summary.bytesTransferred) reused=\(summary.bytesReused) dry_run=\(summary.dryRun)")
-        if summary.failed > 0 || summary.pending > 0 || summary.unclassifiableAssets > 0 { Foundation.exit(1) }
+        let mirror = try OriginalsMirror(library: library, configuration: config, store: store, logger: log)
+        let summary = await mirror.sync(filter: filter, dryRun: args.dryRun)
+        if summary.failed > 0 || summary.pending > 0 { Foundation.exit(1) }
     }
 
     private static func loggerFor(_ config: AppConfiguration) -> SafeLogger {
@@ -121,7 +117,21 @@ struct PhotosBackupCommand {
             return nil
         }
         return SafeLogger(url: config.resolve(config.logPath), maxBytes: config.logMaxBytes, count: config.logFileCount,
-                          secrets: [connectionString] + privateValues)
+                          secrets: [connectionString] + privateValues, outputToStandardOutput: true)
+    }
+
+    private static func prepareLaunchAgentOutput(_ logger: SafeLogger) {
+        guard ProcessInfo.processInfo.environment["PHOTOS_BACKUP_LAUNCH_AGENT"] == "1" else { return }
+        for descriptor in [STDOUT_FILENO, STDERR_FILENO] {
+            var info = stat()
+            guard fstat(descriptor, &info) == 0,
+                  (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else { continue }
+            guard ftruncate(descriptor, 0) == 0 else {
+                logger.error("Could not reset the previous LaunchAgent output log")
+                continue
+            }
+            _ = lseek(descriptor, 0, SEEK_SET)
+        }
     }
 
     private static func service(_ args: Arguments) async throws {
@@ -166,7 +176,8 @@ struct PhotosBackupCommand {
 
     fileprivate static func runLaunchctl(_ args: [String]) -> Int32 {
         let process = Process(); process.executableURL = URL(fileURLWithPath: "/bin/launchctl"); process.arguments = args
-        process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.standardError
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = args.first == "print" ? FileHandle.nullDevice : FileHandle.standardError
         do { try process.run(); process.waitUntilExit(); return process.terminationStatus } catch { return -1 }
     }
 

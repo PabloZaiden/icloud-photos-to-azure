@@ -110,7 +110,7 @@ private struct PersistedRuntimeSettings: Codable {
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library", isDirectory: true)
         return PersistedRuntimeSettings(
             blobEndpoint: nil, azureCliPath: nil, azureCliSubscription: nil,
-            container: "photos-backup", prefix: "photos-backup", libraryID: UUID().uuidString,
+            container: "photos-backup", prefix: "", libraryID: UUID().uuidString,
             spoolDirectory: root.appendingPathComponent("Spool", isDirectory: true).path,
             journalPath: root.appendingPathComponent("state/journal.json").path,
             logPath: logsBase.appendingPathComponent("Logs/PhotosBackup/backup.log").path,
@@ -126,7 +126,7 @@ private struct PersistedRuntimeSettings: Codable {
             azureCliPath: document.azureCliPath ?? defaults.azureCliPath,
             azureCliSubscription: document.azureCliSubscription ?? defaults.azureCliSubscription,
             container: document.container ?? defaults.container,
-            prefix: document.prefix ?? defaults.prefix,
+            prefix: (document.prefix ?? defaults.prefix) == "photos-backup" ? "" : (document.prefix ?? defaults.prefix),
             libraryID: document.libraryID ?? defaults.libraryID,
             spoolDirectory: document.spoolDirectory ?? defaults.spoolDirectory,
             journalPath: document.journalPath ?? defaults.journalPath,
@@ -161,7 +161,14 @@ private struct PersistedRuntimeSettings: Codable {
             let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
             let mode = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
             guard mode & 0o077 == 0 else { throw BackupError.invalidConfiguration("internal settings permissions must be 0600 or stricter") }
-            do { return try JSONDecoder().decode(PersistedRuntimeSettings.self, from: Data(contentsOf: url)) }
+            do {
+                var settings = try JSONDecoder().decode(PersistedRuntimeSettings.self, from: Data(contentsOf: url))
+                if settings.prefix == "photos-backup" {
+                    settings.prefix = ""
+                    try save(settings, to: url)
+                }
+                return settings
+            }
             catch { throw BackupError.invalidConfiguration("could not read internal Photos Backup settings") }
         }
         guard errno == ENOENT else { throw BackupError.invalidConfiguration("could not inspect internal Photos Backup settings") }
@@ -432,11 +439,15 @@ public final class SafeLogger {
     private let url: URL
     private let maxBytes: Int64
     private let count: Int
+    private let outputToStandardOutput: Bool
     private let lock = NSLock()
     private let secrets: [String]
 
-    public init(url: URL, maxBytes: Int64, count: Int, secrets: [String] = []) {
-        self.url = url; self.maxBytes = maxBytes; self.count = count; self.secrets = secrets.filter { !$0.isEmpty }
+    public init(url: URL, maxBytes: Int64, count: Int, secrets: [String] = [],
+                outputToStandardOutput: Bool = false) {
+        self.url = url; self.maxBytes = maxBytes; self.count = count
+        self.outputToStandardOutput = outputToStandardOutput
+        self.secrets = secrets.filter { !$0.isEmpty }
     }
     public func info(_ message: String) { write("INFO", message) }
     public func error(_ message: String) { write("ERROR", message) }
@@ -445,6 +456,8 @@ public final class SafeLogger {
         var message = input
         for secret in secrets { message = message.replacingOccurrences(of: secret, with: "[REDACTED]") }
         let line = "\(Date().iso8601Fractional) \(level) \(message.replacingOccurrences(of: "\n", with: " "))\n"
+        let data = Data(line.utf8)
+        if outputToStandardOutput { try? FileHandle.standardOutput.write(contentsOf: data) }
         do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             var info = stat()
@@ -467,7 +480,6 @@ public final class SafeLogger {
                     if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.moveItem(at: url, to: rotated) }
                 } else { try? FileManager.default.removeItem(at: url) }
             }
-            let data = Data(line.utf8)
             if FileManager.default.fileExists(atPath: url.path) {
                 let handle = try FileHandle(forWritingTo: url); try handle.seekToEnd(); try handle.write(contentsOf: data); try handle.close()
             } else { try data.write(to: url); try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path) }

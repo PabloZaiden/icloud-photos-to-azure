@@ -4,7 +4,7 @@
   <img src="logo.svg" alt="Photos Backup icon" width="180">
 </p>
 
-A macOS command-line backup for the accessible Photos library. It stores original resources and the current rendered representation in an existing Azure Blob container. It does not modify Photos or delete remote objects when assets are removed locally.
+A macOS command-line backup of original resources exposed by the system Photos library. Azure blobs keep each real resource filename. If an original exists only in iCloud, Photos is asked to download it only when Azure needs that resource uploaded. Rendered edits are not included. The backup never modifies Photos or deletes remote files when local originals disappear.
 
 ## Build and package
 
@@ -42,7 +42,7 @@ photo-backup sync
 photo-backup service install
 ```
 
-`config` creates the private config automatically. For AccountKey or SAS instead, run `photo-backup config --connection-string`; it prompts with input hidden. The executable uses the existing `photos-backup` container and prefix, so neither belongs in the config. The active Azure CLI subscription is used; run `az account set --subscription ...` first only if needed.
+`config` creates the private config automatically. For AccountKey or SAS instead, run `photo-backup config --connection-string`; it prompts with input hidden. The executable uses the existing `photos-backup` container; neither container nor prefix belongs in the config. The active Azure CLI subscription is used; run `az account set --subscription ...` first only if needed.
 
 Azure CLI asks for a token scoped to Storage, keeps it in memory, and refreshes it before expiry. It does not write the token to config, journal, or logs. Azure CLI persists the signed-in account's refresh credentials for later token requests; the daily LaunchAgent runs as that same macOS user. The executable finds `az` on `PATH` and common Homebrew paths. [Azure CLI documents token expiry and how `az login` stores the session](https://learn.microsoft.com/en-us/cli/azure/authenticate-azure-cli-interactively).
 
@@ -57,7 +57,7 @@ photo-backup authorize
 photo-backup doctor
 ```
 
-`authorize` requests full Photos read access. Limited Photos access is not enough for a whole-library backup. `doctor` checks that full authorization is present, the spool directory is writable, and an isolated temporary blob can be written, read, and deleted under the configured prefix. It does not export a photo, validate every library item, check iCloud synchronization completeness, or prove backup fidelity.
+`authorize` requests full Photos read access. `doctor` checks access to the system Photos library through PhotoKit and writes/reads/deletes an isolated temporary blob. It does not copy photos or verify iCloud synchronization.
 
 ## Sync
 
@@ -68,29 +68,25 @@ photo-backup sync --to 2024-12-31
 photo-backup sync --from 2024-01-01 --to 2024-12-31 --dry-run
 ```
 
-With no dates, the command enumerates the full accessible library on every run; it does not use a last-run watermark. Dates use the Photos capture date in the Mac's current time zone, and both ends are inclusive. Missing capture dates are included only without a filter; with a filter, they are reported as unclassifiable and the run exits nonzero. A dry run queries Photos inventory and Azure manifests but does not export/download resources, write blobs, update manifests, or clear recovery state. It reports `would upload` candidates; a changed source date may need export/hash comparison in a real run, so this is an estimate.
+With no dates, the command enumerates every original resource in the system Photos library through PhotoKit. `--from` and `--to` filter by the asset's capture date in the Mac's current time zone, with inclusive date boundaries. A dry run compares resource identity and known size against Azure without exporting, downloading from iCloud, or uploading file bytes. When Photos does not report a resource size, the dry run can only report a candidate; an actual sync exports the resource only after it is identified as missing or stale in Azure.
 
-Each `PHAssetResource` original is considered independently, including photo/video components of Live Photos, alternate RAW/JPEG resources, audio, and hidden assets. The current representation prefers Photos' full-size rendered photo, video, or paired-video resource. If that resource is absent, the executable asks Photos for its current rendered editing input (and a current Live Photo for the motion component) with network access enabled. When the asset has no edits, the original is the current representation. If Photos cannot supply a current render, the resource fails visibly instead of backing up the wrong bytes.
+The mirror preserves each original filename, including videos, Live Photo components, and separate RAW/JPEG files. PhotoKit exposes asset IDs and resource filenames, but Apple does not expose the private package-relative path under `Originals`. Azure therefore stores each file as `Originals/<asset-id>/<resource-kind>/<type>/<original-filename>` to avoid filename collisions. The asset ID and type components are reversible identifiers, not content hashes; blobs contain the actual file bytes and do not use hash-named objects or metadata-only manifests. Blob Content-Type comes from Photos' resource type.
 
-Resource identity uses the Photos asset local identifier, representation, resource kind, and a digest of the UTI. Filename and enumeration order are not identity. If one asset contains multiple indistinguishable resources with the same kind and UTI, the run flags incomplete coverage and skips those resources rather than assigning unstable ordinals. Local identifiers are specific to one Photos library and are not cross-Mac deduplication IDs.
-
-The PhotoKit inventory enables both hidden assets and all burst frames. PhotoKit does not provide a verified full-library export path for Recently Deleted, and Shared Albums coverage has not been validated; this tool does not claim those collections are backed up. Album organization, faces, edit history, and automatic restore are outside scope. A completed sync also cannot certify that iCloud has finished downloading/synchronizing every item.
+The system library is selected by Photos and accessed through PhotoKit; the command does not search `~/Pictures` or open the `.photoslibrary` package. The Azure preflight does not read photo bytes. When a resource needs uploading, PhotoKit network access is enabled so it can download an iCloud-only original; download or network errors are reported as failures and retried by a later run. Already-backed-up resources and dry runs do not trigger those downloads. The mirror does not copy edited renders.
 
 ## Incremental storage and recovery
 
-The Azure container holds three forms of blob:
+Each Azure blob stores the actual original bytes. Custom metadata identifies the Photos asset/resource and records its filename, type, size, and source modification date. Each run reads Azure's `Originals/` catalog as a paginated listing with metadata, then compares it to Photos locally instead of issuing one `HEAD` request per resource. A temporary SQLite catalog holds the remote inventory and upload plan on disk, keeping memory use bounded; it is removed at the end of the run. The client skips an existing blob when its resource identity and size match, preserves an Azure version marked newer, and conditionally replaces a different or older version at the same resource path.
 
-- `manifests/...` blobs contain metadata for one logical original/current resource and point to its current SHA-256 object.
-- `objects/<library>/<sha256>` blobs are immutable content-addressed files. Original and current manifests in the same library reuse the same object when bytes match. Older edited versions remain as objects when the current manifest moves after a later edit or revert.
-- `archives/<identity>/<sha256>` blobs are historical pointers for a retained, fully exported resource that disappeared from a successful full-library inventory before its interrupted upload completed.
+Large files upload in blocks. Block IDs are derived from file size, asset creation date (or modification date when capture date is missing), and block number, so a later run can reuse uncommitted blocks without naming the blob by a hash. The PhotoKit resource identity is rechecked before commit. Writes use ETags; if a commit response is lost, the client checks the blob's stored size and source metadata. Azure can expire uncommitted blocks after roughly a week without successful operations; a later run resends expired blocks. Removing a local resource never deletes its Azure blob.
 
-Blob metadata records the identity hash, representation, source date, file name/type, object name, size, schema, and content hash. A local cache never proves that an Azure object still exists. Remote writes use ETags and conditional creation/update; concurrent changes are re-read rather than overwritten blindly. If the Photos source date is missing, the content is exported and rehashed each run. A dated Azure version newer than a local dated version is preserved. If the local date is unknown and the bytes differ from a dated destination, the run reports a conflict.
+The previous hash/manifests layout may remain under the old `photos-backup/` prefix from earlier runs. The new sync does not read or delete that legacy layout. Those blobs are kept until a separate migration and cleanup is authorized.
 
-Exports are streamed to a private spool file one resource at a time and SHA-256 is computed in bounded memory. The journal is atomically persisted before export and after each completed block checkpoint. After a crash, the next process verifies the retained file and origin, checks Azure's uncommitted block list, and sends only missing blocks for the exact content hash and segmentation. Block IDs include the block size, so changing segmentation cannot combine versions. If a commit response is lost, the client checks the committed blob before retrying. Azure may expire uncommitted blocks after about a week without successful operations; the internal spool limit is 20 GiB, and expired blocks must be sent again. Completed objects stay backed up even when another resource fails.
+## Logs
 
-When a journal is corrupt or lost, untracked spool files are discarded conservatively; the next sync re-exports and Azure block IDs allow any still-present identical blocks to be reused. Interrupted partial exports are discarded. The journal does not store Azure credentials. Failures leave resources pending for a later run and produce a nonzero exit status.
+Each sync writes timestamped events to standard output and the private rotating log at `~/Library/Logs/PhotosBackup/backup.log` by default. Before uploading, it logs how many resources are candidates, how many are already backed up, known candidate bytes, and any preflight failures. Each in-scope resource gets start/end events with its filename, type, estimated and actual size, result, elapsed time, and bytes sent/reused. `FILE_SOURCE_READY` records the actual size after Photos exports a local resource.
 
-The backup is cumulative: removing an asset in Photos does not remove its Azure objects or manifests. If a resource disappears while a verified full export is still pending, a successful unfiltered inventory completes that snapshot and records an archive pointer before freeing its local spool. The object path is private to the configured library namespace, so rebuilding a Photos library or switching Macs creates a distinct logical backup.
+The LaunchAgent captures stdout/stderr in `backup.log.launchd` for the latest service run; it resets that capture at the start of each run. The rotating `backup.log` keeps history across runs. Reinstall an existing LaunchAgent with `photo-backup service install` to update its output paths.
 
 ## Daily LaunchAgent
 
@@ -102,11 +98,11 @@ photo-backup service status
 photo-backup service uninstall
 ```
 
-`install` first requests full Photos access if needed, checks the local spool and performs `doctor`'s Azure write/read/delete probe. It checks that the current user can write the LaunchAgents directory, then installs and loads the job only if all preflight checks pass. A denied Photos permission or failed Azure check leaves the service uninstalled. The job runs daily at 2:00 AM local time while the user is logged in; it does not start a backup immediately when installed. launchd may run a missed calendar event after wake; the Mac must be powered on and the user session available. It is not a daemon that runs while logged out. Uninstalling unloads/removes only the plist and keeps config, journal, logs, spool, and remote blobs. Standard error goes to `<logPath>.launchd`; application logs rotate by internal defaults.
+`install` first requests Photos access if needed, checks the system library through PhotoKit and runs `doctor`'s Azure probe. It checks that the current user can write the LaunchAgents directory, then installs and loads the job only if preflight succeeds. The job runs daily at 2:00 AM local time while the user is logged in; installation does not start a sync immediately. launchd may run a missed calendar event after wake. Uninstalling removes only the LaunchAgent plist and preserves the local configuration and all Azure blobs.
 
 ## Tests
 
-The regular suite uses fixture PhotoKit and a fake BlobStore. It covers date boundaries and DST, hidden/burst selection policy, object/manifest behavior, edits and reverts, missing remote objects, ETag conflicts, partial blocks across new engine instances, changed block sizing, changed source bytes, corrupted/lost checkpoints, disk limits, lost commit replies, and Azure CLI bearer-token acquisition/caching without exposing CLI stderr.
+The existing unit suite covers Azure REST behavior, date boundaries, and the previous PhotoKit backup engine. It does not read the user's Photos library or validate the new direct `Originals` mirror.
 
 The Azure CLI integration test is opt-in. Its private config needs only `storageAccountName`; it uploads synthetic bytes under a unique name, exercises block reconciliation/commit/download/conditional writes, and cleans up its blobs:
 
@@ -130,4 +126,4 @@ PHOTOS_BACKUP_INTEGRATION_CONFIG="$HOME/Library/Application Support/PhotosBackup
 swift test --filter AzureBlobStoreTests/testPrivateAzureSASBlockUploadIsAvailableAsOptInIntegration
 ```
 
-No test needs Photos authorization. Real Photos export fidelity (including iCloud-only originals, edited videos, and Live Photos), LaunchAgent/TCC persistence, and a representative library over 100 GB still need a controlled user-machine validation. The current host build and synthetic storage tests are not a proof of those checks.
+No automated test needs Photos authorization. A representative library still needs validation on the user's Mac. Cloud-only originals are outside this mirror by design.

@@ -70,6 +70,7 @@ public struct BackupItem: Codable, Hashable, Identifiable {
     public let sourceModified: Date?
     public let creationDate: Date?
     public let contentType: String
+    public let sourceSize: Int64?
     public let identityAmbiguous: Bool
     public let resourceKind: String
     public let exportUnavailableReason: String?
@@ -94,10 +95,11 @@ public struct BackupItem: Codable, Hashable, Identifiable {
 
     public init(libraryID: String, assetID: String, resourceID: String, representation: Representation,
                 filename: String, uniformType: String, sourceModified: Date?, creationDate: Date?, contentType: String,
-                identityAmbiguous: Bool = false, resourceKind: String = "", exportUnavailableReason: String? = nil) {
+                sourceSize: Int64? = nil, identityAmbiguous: Bool = false, resourceKind: String = "", exportUnavailableReason: String? = nil) {
         self.libraryID = libraryID; self.assetID = assetID; self.resourceID = resourceID
         self.representation = representation; self.filename = filename; self.uniformType = uniformType
         self.sourceModified = sourceModified; self.creationDate = creationDate; self.contentType = contentType
+        self.sourceSize = sourceSize
         self.identityAmbiguous = identityAmbiguous
         self.resourceKind = resourceKind; self.exportUnavailableReason = exportUnavailableReason
     }
@@ -116,12 +118,32 @@ public struct ExportDescriptor: Codable, Hashable {
     }
 }
 
-public struct BlobRecord: Equatable {
+public struct BlobRecord: Codable, Equatable {
     public let etag: String
     public let size: Int64
     public let metadata: [String: String]
     public init(etag: String, size: Int64, metadata: [String: String]) {
         self.etag = etag; self.size = size; self.metadata = metadata
+    }
+}
+
+public struct ListedBlob: Equatable {
+    public let name: String
+    public let record: BlobRecord
+
+    public init(name: String, record: BlobRecord) {
+        self.name = name
+        self.record = record
+    }
+}
+
+public struct BlobListPage: Equatable {
+    public let blobs: [ListedBlob]
+    public let continuationToken: String?
+
+    public init(blobs: [ListedBlob], continuationToken: String?) {
+        self.blobs = blobs
+        self.continuationToken = continuationToken
     }
 }
 
