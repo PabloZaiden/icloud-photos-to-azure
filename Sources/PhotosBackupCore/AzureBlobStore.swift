@@ -33,6 +33,32 @@ public final class AzureBlobStore: BlobStore {
         return BlobRecord(etag: etag, size: size, metadata: metadata(from: response))
     }
 
+    public func listBlobs(prefix requestedPrefix: String, marker: String? = nil) async throws -> BlobListPage {
+        let requested = requestedPrefix.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        var fullPrefix = [prefix, requested].filter { !$0.isEmpty }.joined(separator: "/")
+        if requestedPrefix.hasSuffix("/"), !fullPrefix.isEmpty { fullPrefix += "/" }
+        var query = [
+            ("restype", "container"),
+            ("comp", "list"),
+            ("include", "metadata"),
+            ("maxresults", "5000"),
+            ("prefix", fullPrefix)
+        ]
+        if let marker, !marker.isEmpty { query.append(("marker", marker)) }
+        let (response, data) = try await send(method: "GET", name: "", query: query, includePrefix: false)
+        try ensureSuccess(response, data)
+        let page = try AzureBlobListingParser.parse(data)
+        let configuredPrefix = prefix.isEmpty ? "" : prefix + "/"
+        let blobs = try page.blobs.map { blob -> ListedBlob in
+            guard blob.name.hasPrefix(configuredPrefix) else {
+                throw BackupError.storage("Azure returned a blob outside the configured prefix")
+            }
+            let relativeName = String(blob.name.dropFirst(configuredPrefix.count))
+            return ListedBlob(name: relativeName, record: blob.record)
+        }
+        return BlobListPage(blobs: blobs, continuationToken: page.continuationToken)
+    }
+
     public func uncommittedBlockIDs(_ name: String) async throws -> Set<String> {
         let (response, data) = try await send(method: "GET", name: name, query: [("comp", "blocklist"), ("blocklisttype", "uncommitted")])
         if response.statusCode == 404 { return [] }
@@ -54,10 +80,23 @@ public final class AzureBlobStore: BlobStore {
     }
 
     public func commit(_ name: String, blockIDs: [String], metadata: [String: String], ifMatch: String?, ifNoneMatch: Bool) async throws -> BlobRecord {
+        try await commitBlockList(name, blockIDs: blockIDs, contentType: nil, metadata: metadata,
+                                  ifMatch: ifMatch, ifNoneMatch: ifNoneMatch)
+    }
+
+    public func commitFile(_ name: String, blockIDs: [String], contentType: String, metadata: [String: String],
+                           ifMatch: String?, ifNoneMatch: Bool) async throws -> BlobRecord {
+        try await commitBlockList(name, blockIDs: blockIDs, contentType: contentType, metadata: metadata,
+                                  ifMatch: ifMatch, ifNoneMatch: ifNoneMatch)
+    }
+
+    private func commitBlockList(_ name: String, blockIDs: [String], contentType: String?, metadata: [String: String],
+                                 ifMatch: String?, ifNoneMatch: Bool) async throws -> BlobRecord {
         let entries = blockIDs.map { "<Uncommitted>\($0)</Uncommitted>" }.joined()
         let body = Data("<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>\(entries)</BlockList>".utf8)
         var headers = try azureMetadataHeaders(metadata)
         headers["Content-Type"] = "application/xml"
+        if let contentType { headers["x-ms-blob-content-type"] = contentType }
         if let ifMatch { headers["If-Match"] = ifMatch }
         if ifNoneMatch { headers["If-None-Match"] = "*" }
         let (response, data) = try await send(method: "PUT", name: name, query: [("comp", "blocklist")], body: body, extra: headers)
@@ -73,7 +112,18 @@ public final class AzureBlobStore: BlobStore {
     }
 
     public func publish(_ name: String, metadata: [String: String], ifMatch: String?, ifNoneMatch: Bool) async throws -> BlobRecord {
+        try await publishBlob(name, contentType: nil, metadata: metadata, ifMatch: ifMatch, ifNoneMatch: ifNoneMatch)
+    }
+
+    public func publishFile(_ name: String, contentType: String, metadata: [String: String],
+                            ifMatch: String?, ifNoneMatch: Bool) async throws -> BlobRecord {
+        try await publishBlob(name, contentType: contentType, metadata: metadata, ifMatch: ifMatch, ifNoneMatch: ifNoneMatch)
+    }
+
+    private func publishBlob(_ name: String, contentType: String?, metadata: [String: String],
+                             ifMatch: String?, ifNoneMatch: Bool) async throws -> BlobRecord {
         var headers = try azureMetadataHeaders(metadata); headers["x-ms-blob-type"] = "BlockBlob"
+        if let contentType { headers["x-ms-blob-content-type"] = contentType }
         if let ifMatch { headers["If-Match"] = ifMatch }
         if ifNoneMatch { headers["If-None-Match"] = "*" }
         let (response, data) = try await send(method: "PUT", name: name, body: Data(), extra: headers)
@@ -216,6 +266,79 @@ public final class AzureBlobStore: BlobStore {
         // URLQueryItem leaves some reserved characters, including '+', literal. Azure
         // decodes '+' as a space in block IDs, so encode every non-RFC3986-unreserved byte.
         part.addingPercentEncoding(withAllowedCharacters: CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.~")) ?? part
+    }
+}
+
+private final class AzureBlobListingParser: NSObject, XMLParserDelegate {
+    private struct ParsedBlob {
+        var name: String?
+        var etag: String?
+        var size: Int64?
+        var metadata: [String: String] = [:]
+    }
+
+    private var path: [String] = []
+    private var text = ""
+    private var currentBlob: ParsedBlob?
+    private var parsedBlobs: [ListedBlob] = []
+    private var marker: String?
+    private var malformedBlob = false
+
+    static func parse(_ data: Data) throws -> BlobListPage {
+        let delegate = AzureBlobListingParser()
+        let parser = XMLParser(data: data)
+        parser.delegate = delegate
+        guard parser.parse(), !delegate.malformedBlob else {
+            throw BackupError.storage("Azure returned an invalid blob listing")
+        }
+        return BlobListPage(blobs: delegate.parsedBlobs, continuationToken: delegate.marker)
+    }
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String,
+                namespaceURI: String?, qualifiedName qName: String?, attributes: [String: String] = [:]) {
+        let name = elementName.lowercased()
+        path.append(name)
+        text = ""
+        if name == "blob" { currentBlob = ParsedBlob() }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        text += string
+    }
+
+    func parser(_ parser: XMLParser, didEndElement elementName: String,
+                namespaceURI: String?, qualifiedName qName: String?) {
+        let name = elementName.lowercased()
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentPath = path.joined(separator: "/")
+        if currentBlob != nil {
+            switch currentPath {
+            case "enumerationresults/blobs/blob/name": currentBlob?.name = value
+            case "enumerationresults/blobs/blob/properties/etag": currentBlob?.etag = value
+            case "enumerationresults/blobs/blob/properties/content-length": currentBlob?.size = Int64(value)
+            default:
+                if currentPath.hasPrefix("enumerationresults/blobs/blob/metadata/"),
+                   let metadataKey = path.last, !metadataKey.isEmpty {
+                    currentBlob?.metadata[metadataKey] = value
+                }
+            }
+            if name == "blob" {
+                if let blob = currentBlob, let blobName = blob.name, !blobName.isEmpty,
+                   let etag = blob.etag, !etag.isEmpty, let size = blob.size, size >= 0 {
+                    parsedBlobs.append(ListedBlob(name: blobName,
+                                                  record: BlobRecord(etag: etag, size: size,
+                                                                     metadata: blob.metadata)))
+                } else {
+                    malformedBlob = true
+                    parser.abortParsing()
+                }
+                currentBlob = nil
+            }
+        } else if currentPath == "enumerationresults/nextmarker" {
+            marker = value.isEmpty ? nil : value
+        }
+        if !path.isEmpty { path.removeLast() }
+        text = ""
     }
 }
 

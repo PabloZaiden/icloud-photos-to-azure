@@ -2,7 +2,6 @@ import Foundation
 #if canImport(Photos)
 import Photos
 import UniformTypeIdentifiers
-import CryptoKit
 @preconcurrency import AVFoundation
 
 public final class PhotoKitLibrary: PhotoLibrary {
@@ -19,6 +18,16 @@ public final class PhotoKitLibrary: PhotoLibrary {
         await withCheckedContinuation { continuation in
             PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in continuation.resume(returning: Self.describe(status)) }
         }
+    }
+
+    public func checkAvailability() throws {
+        guard status == .authorized else {
+            throw BackupError.permission("full read access is required (current status: \(authorization())); run photo-backup authorize")
+        }
+        if let reason = PHPhotoLibrary.shared().unavailabilityReason {
+            throw BackupError.permission("the system Photos library is unavailable (\((reason as NSError).code))")
+        }
+        _ = PHAsset.fetchAssets(with: PHFetchOptions()).count
     }
     private static func describe(_ status: PHAuthorizationStatus) -> String {
         switch status {
@@ -46,6 +55,13 @@ public final class PhotoKitLibrary: PhotoLibrary {
         }
     }
 
+    public func enumerateOriginals(filter: DateFilter, consume: (BackupItem) async throws -> Void) async throws {
+        try await enumerate(filter: filter) { item in
+            guard item.representation == .original else { return }
+            try await consume(item)
+        }
+    }
+
     private func items(for asset: PHAsset) -> [BackupItem] {
         var output: [BackupItem] = []
         let resources = PHAssetResource.assetResources(for: asset)
@@ -57,11 +73,12 @@ public final class PhotoKitLibrary: PhotoLibrary {
             let ambiguous = sorted.count > 1
             for (index, resource) in sorted.enumerated() {
                 let kind = Self.kind(for: resource.type)
-                let utiDigest = Self.shortHash(resource.uniformTypeIdentifier)
-                let resourceID = ambiguous ? "\(kind)-ambiguous-\(utiDigest)-\(index)" : "\(kind)-\(utiDigest)"
+                let resourceType = resource.uniformTypeIdentifier
+                let resourceID = ambiguous ? "\(kind)-\(resourceType)-ambiguous-\(index)" : "\(kind)-\(resourceType)"
                 output.append(Self.item(libraryID: self.libraryID, asset: asset, resourceID: resourceID,
                                         resourceKind: kind, representation: .original, filename: Self.filename(resource),
-                                        uti: resource.uniformTypeIdentifier, identityAmbiguous: ambiguous))
+                                        uti: resource.uniformTypeIdentifier, sourceSize: Self.dataSize(resource),
+                                        identityAmbiguous: ambiguous))
             }
         }
 
@@ -72,7 +89,7 @@ public final class PhotoKitLibrary: PhotoLibrary {
             guard emitted.insert(kind).inserted else { continue }
             output.append(Self.item(libraryID: self.libraryID, asset: asset, resourceID: "current-\(kind)",
                                     resourceKind: kind, representation: .current, filename: Self.filename(resource),
-                                    uti: resource.uniformTypeIdentifier,
+                                    uti: resource.uniformTypeIdentifier, sourceSize: Self.dataSize(resource),
                                     identityAmbiguous: fullSize.filter { Self.currentKind($0.type, asset: asset) == kind }.count > 1))
         }
 
@@ -114,6 +131,37 @@ public final class PhotoKitLibrary: PhotoLibrary {
         return descriptor
     }
 
+    public func exportOriginal(_ item: BackupItem, to destination: URL,
+                               maximumBytes: Int64) async throws -> ExportDescriptor {
+        guard status == .authorized else { throw BackupError.permission("Photos read authorization was revoked") }
+        guard item.representation == .original else { throw BackupError.integrity("only original resources can be mirrored") }
+        guard !item.identityAmbiguous else { throw BackupError.integrity("PhotoKit exposes multiple indistinguishable original resources") }
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [item.assetID], options: nil).firstObject else {
+            throw BackupError.conflict("Photos asset disappeared before export")
+        }
+        guard let resource = try resolve(item, asset: asset) else { throw BackupError.integrity("original resource is unavailable") }
+        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        do {
+            // Network access is enabled only after preflight shows that Azure needs
+            // this resource, allowing PhotoKit to fetch originals stored only in iCloud.
+            try await stream(resource, to: destination, maximumBytes: maximumBytes, allowNetwork: true)
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
+        do { try await verifyOriginal(item) }
+        catch { try? FileManager.default.removeItem(at: destination); throw error }
+        return Self.descriptor(resource)
+    }
+
+    public func verifyOriginal(_ item: BackupItem) async throws {
+        guard item.representation == .original,
+              let asset = PHAsset.fetchAssets(withLocalIdentifiers: [item.assetID], options: nil).firstObject else {
+            throw BackupError.conflict("Photos original disappeared during export")
+        }
+        _ = try resolve(item, asset: asset)
+    }
+
     public func verify(_ item: BackupItem) async throws {
         guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [item.assetID], options: nil).firstObject else {
             throw BackupError.conflict("Photos asset disappeared during export")
@@ -148,7 +196,8 @@ public final class PhotoKitLibrary: PhotoLibrary {
         return matches[0]
     }
 
-    private func stream(_ resource: PHAssetResource, to destination: URL, maximumBytes: Int64) async throws {
+    private func stream(_ resource: PHAssetResource, to destination: URL, maximumBytes: Int64,
+                        allowNetwork: Bool = true) async throws {
         guard FileManager.default.createFile(atPath: destination.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
             throw BackupError.storage("could not create temporary export")
         }
@@ -158,7 +207,7 @@ public final class PhotoKitLibrary: PhotoLibrary {
         var exceeded = false
         var requestID: PHAssetResourceDataRequestID = 0
         var cancelRequested = false
-        let options = PHAssetResourceRequestOptions(); options.isNetworkAccessAllowed = true
+        let options = PHAssetResourceRequestOptions(); options.isNetworkAccessAllowed = allowNetwork
         do {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 let issuedID = manager.requestData(for: resource, options: options, dataReceivedHandler: { chunk in
@@ -413,8 +462,11 @@ public final class PhotoKitLibrary: PhotoLibrary {
         default: return nil
         }
     }
-    private static func shortHash(_ value: String) -> String {
-        String(SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined().prefix(20))
+    private static func dataSize(_ resource: PHAssetResource) -> Int64? {
+        guard #available(macOS 27, *), resource.responds(to: Selector(("dataSize"))),
+              let value = resource.perform(Selector(("dataSize")))?.takeUnretainedValue() as? NSNumber else { return nil }
+        let size = value.int64Value
+        return size >= 0 ? size : nil
     }
     private static func filename(_ resource: PHAssetResource) -> String {
         // macOS 27 adds a nullable filename property. Query it dynamically so this
@@ -424,16 +476,17 @@ public final class PhotoKitLibrary: PhotoLibrary {
            let filename = resource.perform(filenameSelector)?.takeUnretainedValue() as? String {
             return filename
         }
-        return resource.originalFilename
+        return resource.perform(Selector(("originalFilename")))?.takeUnretainedValue() as? String ?? ""
     }
     private static func item(libraryID: String, asset: PHAsset, resourceID: String, resourceKind: String,
-                             representation: Representation, filename: String, uti: String, identityAmbiguous: Bool = false,
+                             representation: Representation, filename: String, uti: String, sourceSize: Int64? = nil,
+                             identityAmbiguous: Bool = false,
                              exportUnavailableReason: String? = nil) -> BackupItem {
         let contentType = UTType(uti)?.preferredMIMEType ?? "application/octet-stream"
         return BackupItem(libraryID: libraryID, assetID: asset.localIdentifier, resourceID: resourceID,
                           representation: representation, filename: filename, uniformType: uti,
                           sourceModified: asset.modificationDate, creationDate: asset.creationDate, contentType: contentType,
-                          identityAmbiguous: identityAmbiguous, resourceKind: resourceKind,
+                          sourceSize: sourceSize, identityAmbiguous: identityAmbiguous, resourceKind: resourceKind,
                           exportUnavailableReason: exportUnavailableReason)
     }
 }
@@ -443,8 +496,12 @@ public final class PhotoKitLibrary: PhotoLibrary {
     public init(libraryID: String, policy: PhotoInventoryPolicy = .completeAccessibleLibrary) {}
     public func authorization() -> String { "unsupported" }
     public func requestAuthorization() async -> String { "unsupported" }
+    public func checkAvailability() throws { throw BackupError.permission("PhotoKit is available only on macOS") }
     public func enumerate(filter: DateFilter, consume: (BackupItem) async throws -> Void) async throws { throw BackupError.permission("PhotoKit is available only on macOS") }
+    public func enumerateOriginals(filter: DateFilter, consume: (BackupItem) async throws -> Void) async throws { throw BackupError.permission("PhotoKit is available only on macOS") }
     public func export(_ item: BackupItem, to destination: URL, maximumBytes: Int64) async throws -> ExportDescriptor { throw BackupError.permission("PhotoKit is available only on macOS") }
+    public func exportOriginal(_ item: BackupItem, to destination: URL, maximumBytes: Int64) async throws -> ExportDescriptor { throw BackupError.permission("PhotoKit is available only on macOS") }
+    public func verifyOriginal(_ item: BackupItem) async throws { throw BackupError.permission("PhotoKit is available only on macOS") }
     public func verify(_ item: BackupItem) async throws { throw BackupError.permission("PhotoKit is available only on macOS") }
 }
 #endif

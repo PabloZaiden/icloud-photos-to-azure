@@ -15,7 +15,8 @@ let package = Package(
         .executable(name: "photo-backup", targets: ["photos-backup"])
     ],
     targets: [
-        .target(name: "PhotosBackupCore"),
+        .systemLibrary(name: "CSQLite"),
+        .target(name: "PhotosBackupCore", dependencies: ["CSQLite"]),
         .executableTarget(
             name: "photos-backup",
             dependencies: ["PhotosBackupCore"],

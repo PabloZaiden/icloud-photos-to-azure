@@ -25,6 +25,61 @@ final class AzureBlobStoreTests: XCTestCase {
         XCTAssertFalse(observed.url?.absoluteString.contains("blockid=+/8A") == true)
     }
 
+    func testListBlobsPaginatesAndReturnsMetadataAndRelativeNames() async throws {
+        let config = config(connection: "AccountName=test;AccountKey=dGVzdA==;BlobEndpoint=https://storage.example.test",
+                            prefix: "archive")
+        let store = try AzureBlobStore(configuration: config, session: stubSession(status: 200, headers: [:]))
+        CapturingURLProtocol.body = Data("""
+        <?xml version="1.0" encoding="utf-8"?>
+        <EnumerationResults>
+          <Blobs>
+            <Blob>
+              <Name>archive/Originals/asset-one/image/public.jpeg/one.jpg</Name>
+              <Properties><Content-Length>123</Content-Length><Etag>&quot;etag-one&quot;</Etag></Properties>
+              <Metadata><layout>photokit-originals-v2</layout><source_asset>asset&amp;one</source_asset></Metadata>
+            </Blob>
+          </Blobs>
+          <NextMarker>opaque+marker/=</NextMarker>
+        </EnumerationResults>
+        """.utf8)
+
+        let first = try await store.listBlobs(prefix: "Originals/")
+        XCTAssertEqual(first.blobs.count, 1)
+        XCTAssertEqual(first.blobs[0].name, "Originals/asset-one/image/public.jpeg/one.jpg")
+        XCTAssertEqual(first.blobs[0].record.etag, #""etag-one""#)
+        XCTAssertEqual(first.blobs[0].record.size, 123)
+        XCTAssertEqual(first.blobs[0].record.metadata["layout"], "photokit-originals-v2")
+        XCTAssertEqual(first.blobs[0].record.metadata["source_asset"], "asset&one")
+        XCTAssertEqual(first.continuationToken, "opaque+marker/=")
+
+        let firstRequest = try XCTUnwrap(CapturingURLProtocol.lastRequest)
+        let firstQuery = URLComponents(url: try XCTUnwrap(firstRequest.url), resolvingAgainstBaseURL: false)?.queryItems ?? []
+        XCTAssertEqual(firstQuery.first(where: { $0.name == "prefix" })?.value, "archive/Originals/")
+        XCTAssertEqual(firstQuery.first(where: { $0.name == "include" })?.value, "metadata")
+        XCTAssertEqual(firstQuery.first(where: { $0.name == "maxresults" })?.value, "5000")
+
+        CapturingURLProtocol.body = Data("""
+        <EnumerationResults>
+          <Blobs>
+            <Blob>
+              <Name>archive/Originals/asset-two/video/public.mpeg-4/two.mp4</Name>
+              <Properties><Content-Length>456</Content-Length><Etag>&quot;etag-two&quot;</Etag></Properties>
+              <Metadata><SOURCE_SIZE>456</SOURCE_SIZE></Metadata>
+            </Blob>
+          </Blobs>
+          <NextMarker></NextMarker>
+        </EnumerationResults>
+        """.utf8)
+        let second = try await store.listBlobs(prefix: "Originals/", marker: first.continuationToken)
+        XCTAssertEqual(second.blobs.map(\.name), ["Originals/asset-two/video/public.mpeg-4/two.mp4"])
+        XCTAssertEqual(second.blobs[0].record.metadata["source_size"], "456")
+        XCTAssertNil(second.continuationToken)
+        let secondRequest = try XCTUnwrap(CapturingURLProtocol.lastRequest)
+        let secondQuery = URLComponents(url: try XCTUnwrap(secondRequest.url), resolvingAgainstBaseURL: false)?.queryItems ?? []
+        XCTAssertEqual(secondQuery.first(where: { $0.name == "marker" })?.value, "opaque+marker/=")
+        XCTAssertEqual(secondRequest.httpMethod, "GET")
+    }
+
     func testAzureCliUsesBearerTokenFromCurrentSessionAndCachesItInMemory() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("azure-cli-test-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -219,7 +274,8 @@ final class AzureBlobStoreTests: XCTestCase {
     }
 
     private func stubSession(status: Int, headers: [String: String]) -> URLSession {
-        CapturingURLProtocol.status = status; CapturingURLProtocol.headers = headers; CapturingURLProtocol.lastRequest = nil
+        CapturingURLProtocol.status = status; CapturingURLProtocol.headers = headers
+        CapturingURLProtocol.lastRequest = nil; CapturingURLProtocol.body = Data()
         let configuration = URLSessionConfiguration.ephemeral; configuration.protocolClasses = [CapturingURLProtocol.self]
         return URLSession(configuration: configuration)
     }
@@ -230,13 +286,14 @@ private final class CapturingURLProtocol: URLProtocol {
     static var status = 200
     static var headers: [String: String] = [:]
     static var lastRequest: URLRequest?
+    static var body = Data()
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         Self.lastRequest = request
         let response = HTTPURLResponse(url: request.url!, statusCode: Self.status, httpVersion: "HTTP/1.1", headerFields: Self.headers)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data())
+        client?.urlProtocol(self, didLoad: Self.body)
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() { }

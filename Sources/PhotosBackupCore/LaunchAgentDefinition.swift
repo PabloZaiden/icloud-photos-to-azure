@@ -8,7 +8,8 @@ public enum LaunchAgentDefinition {
         }
         return ["Label": label, "ProgramArguments": [executable.path, "sync", "--config", config.path],
                 "StartCalendarInterval": ["Hour": hour, "Minute": 0], "RunAtLoad": false, "KeepAlive": false,
-                "StandardOutPath": "/dev/null", "StandardErrorPath": log.path + ".launchd"]
+                "EnvironmentVariables": ["PHOTOS_BACKUP_LAUNCH_AGENT": "1"],
+                "StandardOutPath": log.path + ".launchd", "StandardErrorPath": log.path + ".launchd"]
     }
 }
 
@@ -32,13 +33,13 @@ public final class LaunchAgentController {
 
     public func unloadForReplacement() throws {
         guard isLoaded else { return }
-        _ = run(["bootout", domain, "\(domain)/\(label)"])
+        _ = run(["bootout", "\(domain)/\(label)"])
         guard !isLoaded else { throw BackupError.storage("LaunchAgent remains loaded after launchctl bootout") }
     }
 
     public func uninstall() throws {
         if isLoaded {
-            _ = run(["bootout", domain, "\(domain)/\(label)"])
+            _ = run(["bootout", "\(domain)/\(label)"])
             guard !isLoaded else { throw BackupError.storage("LaunchAgent remains loaded; its plist was kept") }
         }
         guard FileManager.default.fileExists(atPath: plistURL.path) else { return }
