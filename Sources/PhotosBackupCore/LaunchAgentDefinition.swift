@@ -8,6 +8,7 @@ public enum LaunchAgentDefinition {
         }
         return ["Label": label, "ProgramArguments": [executable.path, "sync", "--config", config.path],
                 "StartCalendarInterval": ["Hour": hour, "Minute": 0], "RunAtLoad": false, "KeepAlive": false,
+                "LimitLoadToSessionType": "Aqua",
                 "EnvironmentVariables": ["PHOTOS_BACKUP_LAUNCH_AGENT": "1"],
                 "StandardOutPath": log.path + ".launchd", "StandardErrorPath": log.path + ".launchd"]
     }

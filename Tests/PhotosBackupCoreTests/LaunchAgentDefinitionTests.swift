@@ -9,6 +9,7 @@ final class LaunchAgentDefinitionTests: XCTestCase {
                                                            config: config, hour: 2, log: log)
         XCTAssertEqual(plist["ProgramArguments"] as? [String], ["/Users/example/.local/bin/photo-backup", "sync", "--config", config.path])
         XCTAssertEqual(plist["StartCalendarInterval"] as? [String: Int], ["Hour": 2, "Minute": 0])
+        XCTAssertEqual(plist["LimitLoadToSessionType"] as? String, "Aqua")
         XCTAssertEqual(plist["StandardErrorPath"] as? String, log.path + ".launchd")
         XCTAssertEqual(plist["RunAtLoad"] as? Bool, false)
         XCTAssertThrowsError(try LaunchAgentDefinition.propertyList(label: "x", executable: URL(fileURLWithPath: "relative"), config: config, hour: 25, log: log))

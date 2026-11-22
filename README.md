@@ -98,7 +98,7 @@ photo-backup service status
 photo-backup service uninstall
 ```
 
-`install` first requests Photos access if needed, checks the system library through PhotoKit and runs `doctor`'s Azure probe. It checks that the current user can write the LaunchAgents directory, then installs and loads the job only if preflight succeeds. The job runs daily at 2:00 AM local time while the user is logged in; installation does not start a sync immediately. launchd may run a missed calendar event after wake. Uninstalling removes only the LaunchAgent plist and preserves the local configuration and all Azure blobs.
+`install` first requests Photos access if needed, checks the system library through PhotoKit and runs `doctor`'s Azure probe. It checks that the current user can write the LaunchAgents directory, then installs and loads the job only if preflight succeeds. The job is restricted to the logged-in user's Aqua (GUI) session so Photos uses that user's granted privacy permission. It runs daily at 2:00 AM local time while the user is logged in; installation does not start a sync immediately. launchd may run a missed calendar event after wake. Uninstalling removes only the LaunchAgent plist and preserves the local configuration and all Azure blobs.
 
 ## Tests
 
